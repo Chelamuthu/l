@@ -67,37 +67,56 @@ def lora_get_version():
 print("[INFO] SX1262 Version/Status:", lora_get_version())
 
 # ----------------------------
-# Read GNSS Data
+# NMEA parser helpers
 # ----------------------------
+def nmea_to_decimal(raw, direction):
+    """Convert NMEA ddmm.mmmm to decimal degrees"""
+    if raw == "" or direction == "":
+        return None
+    raw = float(raw)
+    degrees = int(raw / 100)
+    minutes = raw - (degrees * 100)
+    decimal = degrees + minutes / 60
+    if direction in ["S", "W"]:
+        decimal = -decimal
+    return decimal
+
 def read_gnss():
+    """Read one NMEA line, return (lat, lon) if valid"""
     if gps:
         line = gps.readline().decode(errors="ignore").strip()
         if line.startswith("$GNGGA") or line.startswith("$GPGGA"):
             parts = line.split(",")
             if len(parts) > 5 and parts[2] != "" and parts[4] != "":
-                lat = float(parts[2]) / 100.0
-                lon = float(parts[4]) / 100.0
+                lat = nmea_to_decimal(parts[2], parts[3])
+                lon = nmea_to_decimal(parts[4], parts[5])
                 return (lat, lon)
     return None
 
 # ----------------------------
 # Main Loop
 # ----------------------------
+last_fix = None
+
 try:
     while True:
         pos = read_gnss()
         if pos:
-            print(f"[GNSS] Lat: {pos[0]}, Lon: {pos[1]}")
+            last_fix = pos
+            print(f"[GNSS] FIX: Lat={pos[0]:.6f}, Lon={pos[1]:.6f}")
+        else:
+            if last_fix:
+                print(f"[GNSS] No fix now, using last known: Lat={last_fix[0]:.6f}, Lon={last_fix[1]:.6f}")
+            else:
+                print("[GNSS] No fix yet...")
 
-            # Send GNSS location via LoRa
-            message = f"LAT:{pos[0]:.5f},LON:{pos[1]:.5f}"
+        # Send position (last fix if available)
+        if last_fix:
+            message = f"LAT:{last_fix[0]:.6f},LON:{last_fix[1]:.6f}"
             data = [ord(c) for c in message]
 
             print("[LORA] Sending:", message)
             lora_write_cmd(0x0E, data)  # Example: WriteBuffer command
-
-        else:
-            print("[GNSS] No fix yet...")
 
         time.sleep(2)
 
