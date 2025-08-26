@@ -1,128 +1,85 @@
 import serial
-import spidev
-import RPi.GPIO as GPIO
 import time
 
-# ----------------------------
-# GPIO Pin mapping (adjust if needed)
-# ----------------------------
-PIN_RESET = 17   # SX1262 Reset pin
-PIN_BUSY  = 18   # SX1262 Busy pin
-PIN_DIO1  = 23   # SX1262 DIO1 pin
-PIN_NSS   = 24   # SX1262 Chip select
+# ------------------------------
+# LoRa Configuration (India band)
+# ------------------------------
+LORA_FREQUENCY = 866000000  # 866 MHz
+SERIAL_PORT = "/dev/ttyAMA0"  # UART port for Raspberry Pi
+BAUDRATE = 115200
 
-# ----------------------------
-# SPI Setup for LoRa
-# ----------------------------
-spi = spidev.SpiDev()
-spi.open(0, 0)   # Bus 0, Device 0 (/dev/spidev0.0)
-spi.max_speed_hz = 5000000
-
-# ----------------------------
-# GPIO Setup
-# ----------------------------
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(PIN_RESET, GPIO.OUT)
-GPIO.setup(PIN_BUSY, GPIO.IN)
-GPIO.setup(PIN_DIO1, GPIO.IN)
-GPIO.setup(PIN_NSS, GPIO.OUT)
-
-# ----------------------------
-# GNSS Setup (via UART)
-# ----------------------------
+# ------------------------------
+# Initialize Serial
+# ------------------------------
 try:
-    gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
-    print("[INFO] GNSS module connected on /dev/ttyAMA0")
+    lora = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+    print(f"✅ Connected to LoRa module on {SERIAL_PORT} at {BAUDRATE} baud")
 except Exception as e:
-    print("[ERROR] Cannot open GNSS UART:", e)
-    gps = None
+    print(f"❌ Failed to connect to LoRa module: {e}")
+    exit()
 
-# ----------------------------
-# Reset SX1262
-# ----------------------------
-def reset_lora():
-    GPIO.output(PIN_RESET, GPIO.LOW)
-    time.sleep(0.05)
-    GPIO.output(PIN_RESET, GPIO.HIGH)
-    time.sleep(0.05)
-    print("[INFO] SX1262 Reset done")
+# ------------------------------
+# Send AT Command to LoRa module
+# ------------------------------
+def send_command(cmd, delay=0.5):
+    try:
+        lora.write((cmd + "\r\n").encode())
+        time.sleep(delay)
+        response = lora.read_all().decode(errors="ignore").strip()
+        if response:
+            print(f"📡 {cmd} -> {response}")
+        else:
+            print(f"⚠️ No response for {cmd}")
+        return response
+    except Exception as e:
+        print(f"⚠️ Error sending command {cmd}: {e}")
+        return ""
 
-reset_lora()
+# ------------------------------
+# Initialize LoRa
+# ------------------------------
+def init_lora():
+    send_command("AT")  # Check communication
+    send_command("AT+RESET")  # Reset LoRa
+    send_command(f"AT+FREQ={LORA_FREQUENCY}")  # Set frequency
+    send_command("AT+BW=125")  # Bandwidth 125kHz
+    send_command("AT+CR=4/5")  # Coding Rate
+    send_command("AT+SF=7")    # Spreading Factor 7
+    send_command("AT+POWER=22")  # TX Power 22dBm
+    send_command("AT+MODE=0")  # Set to LoRa mode
 
-# ----------------------------
-# Send SPI command (basic test)
-# ----------------------------
-def lora_write_cmd(cmd, data=[]):
-    GPIO.output(PIN_NSS, GPIO.LOW)
-    spi.xfer2([cmd] + data)
-    GPIO.output(PIN_NSS, GPIO.HIGH)
+# ------------------------------
+# Transmit a Message
+# ------------------------------
+def transmit_message(message):
+    send_command(f"AT+SEND={len(message)},{message}")
 
-# Example: Get LoRa Chip version
-def lora_get_version():
-    GPIO.output(PIN_NSS, GPIO.LOW)
-    resp = spi.xfer2([0xC0, 0x00])  # Example command (GetStatus / GetVersion may vary)
-    GPIO.output(PIN_NSS, GPIO.HIGH)
+# ------------------------------
+# GNSS Function
+# ------------------------------
+def get_gnss_location():
+    print("📡 Requesting GNSS location...")
+    resp = send_command("AT+GNSS=1", delay=2)  # Start GNSS
+    time.sleep(3)
+    resp = send_command("AT+GNSS=?", delay=2)  # Request location
     return resp
 
-print("[INFO] SX1262 Version/Status:", lora_get_version())
+# ------------------------------
+# Main Program
+# ------------------------------
+if __name__ == "__main__":
+    print("🚀 Initializing LoRa SX1262 Node...")
+    init_lora()
 
-# ----------------------------
-# NMEA parser helpers
-# ----------------------------
-def nmea_to_decimal(raw, direction):
-    """Convert NMEA ddmm.mmmm to decimal degrees"""
-    if raw == "" or direction == "":
-        return None
-    raw = float(raw)
-    degrees = int(raw / 100)
-    minutes = raw - (degrees * 100)
-    decimal = degrees + minutes / 60
-    if direction in ["S", "W"]:
-        decimal = -decimal
-    return decimal
-
-def read_gnss():
-    """Read one NMEA line, return (lat, lon) if valid"""
-    if gps:
-        line = gps.readline().decode(errors="ignore").strip()
-        if line.startswith("$GNGGA") or line.startswith("$GPGGA"):
-            parts = line.split(",")
-            if len(parts) > 5 and parts[2] != "" and parts[4] != "":
-                lat = nmea_to_decimal(parts[2], parts[3])
-                lon = nmea_to_decimal(parts[4], parts[5])
-                return (lat, lon)
-    return None
-
-# ----------------------------
-# Main Loop
-# ----------------------------
-last_fix = None
-
-try:
     while True:
-        pos = read_gnss()
-        if pos:
-            last_fix = pos
-            print(f"[GNSS] FIX: Lat={pos[0]:.6f}, Lon={pos[1]:.6f}")
+        # Transmit test message
+        transmit_message("Hello from India LoRa Node 🚀")
+        
+        # Get GNSS location
+        gps_data = get_gnss_location()
+        if gps_data:
+            print(f"🌍 GNSS Data: {gps_data}")
         else:
-            if last_fix:
-                print(f"[GNSS] No fix now, using last known: Lat={last_fix[0]:.6f}, Lon={last_fix[1]:.6f}")
-            else:
-                print("[GNSS] No fix yet...")
+            print("⚠️ No GNSS data received")
 
-        # Send position (last fix if available)
-        if last_fix:
-            message = f"LAT:{last_fix[0]:.6f},LON:{last_fix[1]:.6f}"
-            data = [ord(c) for c in message]
-
-            print("[LORA] Sending:", message)
-            lora_write_cmd(0x0E, data)  # Example: WriteBuffer command
-
-        time.sleep(2)
-
-except KeyboardInterrupt:
-    print("Exit")
-    spi.close()
-    if gps:
-        gps.close()
-    GPIO.cleanup()
+        time.sleep(10)  # Wait before next transmission
