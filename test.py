@@ -4,15 +4,15 @@ import serial
 from LoRaRF import SX126x
 
 # --- LoRa Setup ---
-busId = 0; csId = 0 
-resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1 
+busId = 0; csId = 0
+resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1
 LoRa = SX126x()
 print("Begin LoRa radio")
 if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
     raise Exception("Something wrong, can't begin LoRa radio")
 
 LoRa.setDio2RfSwitch()
-LoRa.setFrequency(868000000)
+LoRa.setFrequency(865000000)
 LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
 LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
 LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 64, True)
@@ -21,7 +21,7 @@ LoRa.setSyncWord(0x3444)
 print("\n-- LoRa Transmitter with GNSS + Speed + Time --\n")
 
 # --- GNSS Setup ---
-GNSS_PORT = "/dev/ttyUSB0"   # Linux
+GNSS_PORT = "/dev/ttyAMA0"   # Linux
 # GNSS_PORT = "COM5"         # Windows
 GNSS_BAUD = 9600
 
@@ -36,19 +36,34 @@ def convert_lat_lon(lat_str, ns, lon_str, ew):
     """Convert NMEA lat/lon format to decimal degrees"""
     if not lat_str or not lon_str:
         return None, None
-    # Latitude
-    lat_deg = float(lat_str[:2])
-    lat_min = float(lat_str[2:])
-    lat = lat_deg + (lat_min / 60.0)
-    if ns == "S":
-        lat = -lat
-    # Longitude
-    lon_deg = float(lon_str[:3])
-    lon_min = float(lon_str[3:])
-    lon = lon_deg + (lon_min / 60.0)
-    if ew == "W":
-        lon = -lon
-    return lat, lon
+    try:
+        # Latitude
+        lat_deg = float(lat_str[:2])
+        lat_min = float(lat_str[2:])
+        lat = lat_deg + (lat_min / 60.0)
+        if ns == "S":
+            lat = -lat
+        # Longitude
+        lon_deg = float(lon_str[:3])
+        lon_min = float(lon_str[3:])
+        lon = lon_deg + (lon_min / 60.0)
+        if ew == "W":
+            lon = -lon
+        return lat, lon
+    except:
+        return None, None
+
+def format_utc(utc_str):
+    """Convert hhmmss.sss to hh:mm:ss"""
+    if not utc_str or len(utc_str) < 6:
+        return "N/A"
+    try:
+        hh = utc_str[0:2]
+        mm = utc_str[2:4]
+        ss = utc_str[4:6]
+        return f"{hh}:{mm}:{ss} UTC"
+    except:
+        return "N/A"
 
 counter = 0
 while True:
@@ -57,31 +72,29 @@ while True:
     if gps_serial and gps_serial.in_waiting > 0:
         line = gps_serial.readline().decode("utf-8", errors="ignore").strip()
 
+        # Debug raw NMEA
+        if line.startswith("$"):
+            print("NMEA:", line)
+
         # RMC sentence has time, lat, lon, speed
         if line.startswith("$GPRMC"):
             parts = line.split(",")
-            try:
-                utc_time = parts[1]              # hhmmss.sss
-                lat_str, ns = parts[3], parts[4]
-                lon_str, ew = parts[5], parts[6]
-                latitude, longitude = convert_lat_lon(lat_str, ns, lon_str, ew)
+            if len(parts) > 7 and parts[2] == "A":  # 'A' means valid fix
+                utc_time = format_utc(parts[1])
+                latitude, longitude = convert_lat_lon(parts[3], parts[4], parts[5], parts[6])
+                if parts[7]:
+                    try:
+                        speed_knots = float(parts[7])
+                        speed_kmh = speed_knots * 1.852
+                    except:
+                        speed_kmh = None
 
-                speed_knots = parts[7]
-                if speed_knots:
-                    speed_kmh = float(speed_knots) * 1.852
-            except Exception as e:
-                print("Parse error (RMC):", e)
-
-        # GGA sentence has time, lat, lon
+        # GGA sentence has time, lat, lon, fix indicator
         elif line.startswith("$GPGGA"):
             parts = line.split(",")
-            try:
-                utc_time = parts[1]
-                lat_str, ns = parts[2], parts[3]
-                lon_str, ew = parts[4], parts[5]
-                latitude, longitude = convert_lat_lon(lat_str, ns, lon_str, ew)
-            except Exception as e:
-                print("Parse error (GGA):", e)
+            if len(parts) > 6 and parts[6] != "0":  # fix indicator not zero
+                utc_time = format_utc(parts[1])
+                latitude, longitude = convert_lat_lon(parts[2], parts[3], parts[4], parts[5])
 
     # Build message
     if latitude and longitude:
