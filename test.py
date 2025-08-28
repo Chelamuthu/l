@@ -1,8 +1,6 @@
 import os, sys
 import time
 import serial
-import pynmea2
-from datetime import datetime
 from LoRaRF import SX126x
 
 # --- LoRa Setup ---
@@ -17,10 +15,10 @@ LoRa.setDio2RfSwitch()
 LoRa.setFrequency(868000000)
 LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
 LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 128, True)  # payloadLength increased
+LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 64, True)
 LoRa.setSyncWord(0x3444)
 
-print("\n-- LoRa Transmitter with GNSS + Speed + Time + Latency --\n")
+print("\n-- LoRa Transmitter with GNSS + Speed + Time --\n")
 
 # --- GNSS Setup ---
 GNSS_PORT = "/dev/ttyUSB0"   # Linux
@@ -34,66 +32,75 @@ except Exception as e:
     print("Error opening GNSS:", e)
     gps_serial = None
 
+def convert_lat_lon(lat_str, ns, lon_str, ew):
+    """Convert NMEA lat/lon format to decimal degrees"""
+    if not lat_str or not lon_str:
+        return None, None
+    # Latitude
+    lat_deg = float(lat_str[:2])
+    lat_min = float(lat_str[2:])
+    lat = lat_deg + (lat_min / 60.0)
+    if ns == "S":
+        lat = -lat
+    # Longitude
+    lon_deg = float(lon_str[:3])
+    lon_min = float(lon_str[3:])
+    lon = lon_deg + (lon_min / 60.0)
+    if ew == "W":
+        lon = -lon
+    return lat, lon
+
 counter = 0
 while True:
-    latitude, longitude, speed_kmh = None, None, None
+    latitude, longitude, speed_kmh, utc_time = None, None, None, None
 
     if gps_serial and gps_serial.in_waiting > 0:
         line = gps_serial.readline().decode("utf-8", errors="ignore").strip()
-        if line.startswith("$GPRMC"):   # RMC contains speed
+
+        # RMC sentence has time, lat, lon, speed
+        if line.startswith("$GPRMC"):
+            parts = line.split(",")
             try:
-                msg = pynmea2.parse(line)
-                latitude = msg.latitude
-                longitude = msg.longitude
-                if hasattr(msg, "spd_over_grnd") and msg.spd_over_grnd:
-                    speed_knots = float(msg.spd_over_grnd)
-                    speed_kmh = speed_knots * 1.852   # convert knots → km/h
+                utc_time = parts[1]              # hhmmss.sss
+                lat_str, ns = parts[3], parts[4]
+                lon_str, ew = parts[5], parts[6]
+                latitude, longitude = convert_lat_lon(lat_str, ns, lon_str, ew)
+
+                speed_knots = parts[7]
+                if speed_knots:
+                    speed_kmh = float(speed_knots) * 1.852
             except Exception as e:
-                print("Parse error:", e)
+                print("Parse error (RMC):", e)
 
-        elif line.startswith("$GPGGA"):   # fallback for lat/lon only
+        # GGA sentence has time, lat, lon
+        elif line.startswith("$GPGGA"):
+            parts = line.split(",")
             try:
-                msg = pynmea2.parse(line)
-                latitude = msg.latitude
-                longitude = msg.longitude
-            except:
-                pass
+                utc_time = parts[1]
+                lat_str, ns = parts[2], parts[3]
+                lon_str, ew = parts[4], parts[5]
+                latitude, longitude = convert_lat_lon(lat_str, ns, lon_str, ew)
+            except Exception as e:
+                print("Parse error (GGA):", e)
 
-    # --- Add current time (system clock) ---
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # --- Build message ---
+    # Build message
     if latitude and longitude:
-        if speed_kmh is not None:
-            message = (f"Time:{timestamp} "
-                       f"GPS:{latitude:.5f},{longitude:.5f} "
-                       f"Spd:{speed_kmh:.2f}km/h "
-                       f"Cnt:{counter}")
-        else:
-            message = (f"Time:{timestamp} "
-                       f"GPS:{latitude:.5f},{longitude:.5f} "
-                       f"Spd:N/A "
-                       f"Cnt:{counter}")
+        spd_text = f"{speed_kmh:.2f}km/h" if speed_kmh is not None else "N/A"
+        time_text = utc_time if utc_time else "N/A"
+        message = f"GPS:{latitude:.5f},{longitude:.5f} Spd:{spd_text} Time:{time_text} Cnt:{counter}"
     else:
-        message = f"Time:{timestamp} No GPS Fix Cnt:{counter}"
+        message = f"No GPS Fix Cnt:{counter}"
 
     # Convert to bytes
     message_bytes = [ord(c) for c in message]
 
-    # --- Measure latency ---
-    t0 = time.time()
+    # Send via LoRa
     LoRa.beginPacket()
     LoRa.write(message_bytes, len(message_bytes))
     LoRa.endPacket()
     LoRa.wait()
-    t1 = time.time()
-    latency_ms = (t1 - t0) * 1000
 
-    # Print and send latency in message
-    full_message = message + f" Latency:{latency_ms:.1f}ms"
-
-    # For debugging
-    print(f"Sent: {full_message}")
+    print(f"Sent: {message}")
     print("Transmit time: {0:0.2f} ms | Data rate: {1:0.2f} byte/s"
           .format(LoRa.transmitTime(), LoRa.dataRate()))
 
