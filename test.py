@@ -13,7 +13,7 @@ if not lora.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
     print("LoRa init failed!")
     exit(1)
 
-lora.setFrequency(868000000)   # Change to your module band (868/915/433 MHz)
+lora.setFrequency(865000000)   # Change to your module band (868/915/433 MHz)
 lora.setTxPower(22, 0)
 lora.setSpreadingFactor(7)
 lora.setBandwidth(125000)
