@@ -4,7 +4,9 @@ import RPi.GPIO as GPIO
 from LoRaRF import SX126x
 
 # ---------------- GPIO FIX ----------------
-GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.cleanup()              # reset any old state
+GPIO.setmode(GPIO.BCM)      # force BCM mode before LoRa init
 
 # ---------------- GPS SETUP ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
@@ -45,7 +47,9 @@ def parse_nmea(line):
 # ---------------- LORA SETUP ----------------
 busId=0; csId=0; resetPin=18; busyPin=20; irqPin=-1; txenPin=6; rxenPin=-1
 LoRa = SX126x()
+
 def init_lora():
+    GPIO.setmode(GPIO.BCM)   # make sure mode is set again before driver init
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
         raise SystemExit("LoRa init failed")
     LoRa.setDio2RfSwitch()
