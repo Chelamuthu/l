@@ -3,7 +3,7 @@ import time, serial
 from LoRaRF import SX126x
 
 # ---------------- GPS SETUP ----------------
-gps = serial.Serial("/dev/serial0", baudrate=9600, timeout=1)
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
 def nmea_to_decimal(raw, hemi, is_lat=True):
     try:
@@ -18,21 +18,25 @@ def nmea_to_decimal(raw, hemi, is_lat=True):
         return None
 
 def parse_nmea(line):
-    if not line: return None, None
+    """Return (lat, lon, speed_kmh) from NMEA if valid"""
+    if not line: 
+        return None, None, None
     parts = line.split(",")
     try:
-        if line.startswith("$GPRMC") and len(parts) > 6 and parts[2] == "A":
+        if line.startswith("$GPRMC") and len(parts) > 7 and parts[2] == "A":
             lat = nmea_to_decimal(parts[3], parts[4], True)
             lon = nmea_to_decimal(parts[5], parts[6], False)
-            return lat, lon
+            speed_knots = float(parts[7]) if parts[7] else 0.0
+            speed_kmh = speed_knots * 1.852
+            return lat, lon, speed_kmh
         elif (line.startswith("$GPGGA") or line.startswith("$GNGGA")) and len(parts) > 6:
             if parts[6] and int(parts[6]) > 0:
                 lat = nmea_to_decimal(parts[2], parts[3], True)
                 lon = nmea_to_decimal(parts[4], parts[5], False)
-                return lat, lon
+                return lat, lon, None   # no speed in GGA
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 # ---------------- LORA SETUP ----------------
 busId=0; csId=0; resetPin=18; busyPin=20; irqPin=-1; txenPin=6; rxenPin=-1
@@ -56,16 +60,21 @@ try:
     while True:
         try:
             raw_line = gps.readline().decode("ascii","ignore").strip()
-            lat, lon = parse_nmea(raw_line)
+            lat, lon, speed = parse_nmea(raw_line)
         except Exception:
-            lat, lon = None, None
+            lat, lon, speed = None, None, None
 
         now = time.time()
+        timestamp = time.strftime("%H:%M:%S", time.localtime(now))
+
         if lat is not None and lon is not None:
-            msg = f"{lat:.6f},{lon:.6f}"
+            counter += 1
+            speed_kmh = speed if speed is not None else 0.0
+            msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{speed_kmh:.1f}km/h"
             last_send = now
         elif now - last_send > 10:  # no fix for 10s → still send keepalive
-            msg = "NO_FIX"
+            counter += 1
+            msg = f"{counter},{timestamp},NO_FIX"
             last_send = now
         else:
             continue   # don’t spam too fast when no fix
@@ -86,6 +95,7 @@ try:
                         break
                 except Exception:
                     time.sleep(0.05)
+
             if not ok:
                 print("[WARN] TX timeout → resetting LoRa")
                 LoRa.end()
@@ -98,8 +108,14 @@ try:
                 LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT,12,0,True)
                 LoRa.setSyncWord(0x3444)
 
-            print(f"[SENT] {msg}")
-            counter += 1
+            # --- Print metrics ---
+            try:
+                tx_time = LoRa.transmitTime()   # ms
+                rate = LoRa.dataRate()          # B/s
+                print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.2f} B/s")
+            except Exception:
+                print(f"[SENT] {msg} | {len(data)}B")
+
         except Exception as e:
             print("[ERROR] send failed:", e)
             time.sleep(1)
