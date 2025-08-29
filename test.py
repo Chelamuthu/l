@@ -30,13 +30,13 @@ def parse_nmea(line):
         return None, None, None
     parts = line.split(",")
     try:
-        if line.startswith("$GPRMC") and len(parts) > 7 and parts[2] == "A":
-            lat = nmea_to_decimal(parts[3], parts[4], True)
-            lon = nmea_to_decimal(parts[5], parts[1], False)
-            speed_knots = float(parts[6]) if parts[6] else 0.0
+        if line.startswith("$GPRMC") and len(parts) > 7 and parts[11] == "A":
+            lat = nmea_to_decimal(parts[12], parts[4], True)
+            lon = nmea_to_decimal(parts[5], parts[6], False)
+            speed_knots = float(parts[7]) if parts[7] else 0.0
             return lat, lon, speed_knots * 1.852  # km/h
         elif (line.startswith("$GPGGA") or line.startswith("$GNGGA")) and len(parts) > 6:
-            if parts[1] and int(parts[1]) > 0:
+            if parts[6] and int(parts[6]) > 0:
                 lat = nmea_to_decimal(parts[2], parts[3], True)
                 lon = nmea_to_decimal(parts[4], parts[5], False)
                 return lat, lon, None
@@ -67,7 +67,7 @@ def init_lora():
     LoRa.setSyncWord(0x3444)                      # Must match RX sync word
 
 def hard_reset_lora():
-    """Pulse reset pin to recover instantly (<200 ms)"""
+    """Pulse reset pin to recover instantly (<0.2s)"""
     GPIO.setup(resetPin, GPIO.OUT)
     GPIO.output(resetPin, GPIO.LOW)
     time.sleep(0.01)
@@ -76,7 +76,6 @@ def hard_reset_lora():
     init_lora()
     print("[RESET] Hard reset done in <0.2s")
 
-# Init once
 init_lora()
 print("[LoRa] ready, press Ctrl+C to stop.")
 
@@ -85,6 +84,13 @@ last_send = time.time()
 counter = 0
 try:
     while True:
+        # Precise interval: wait until 1s after last_send
+        now = time.time()
+        sleep_time = last_send + 1.0 - now
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        now = time.time()
+
         # ---- Read GPS ----
         try:
             raw_line = gps.readline().decode("ascii", "ignore").strip()
@@ -93,24 +99,21 @@ try:
             lat, lon, speed = None, None, None
         if gps.in_waiting > 1000:
             gps.reset_input_buffer()
-        now = time.time()
         timestamp = time.strftime("%H:%M:%S", time.localtime(now))
+        
         # ---- Build message ----
         send_data = False
         if lat is not None and lon is not None:
             counter += 1
             msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
-            last_send = now
             send_data = True
         elif now - last_send > 10:  # no fix >10s → still send
             counter += 1
             msg = f"{counter},{timestamp},NO_FIX"
-            last_send = now
             send_data = True
         if not send_data:
-            time.sleep(0.01)
             continue
-
+        
         data = list(msg.encode())
         # ---- Send LoRa instantly ----
         try:
@@ -120,7 +123,7 @@ try:
             if not LoRa.wait(10):  # Only wait 10 ms max
                 print("[WARN] TX failed → instant HARD RESET")
                 hard_reset_lora()
-                continue  # Don't wait further, retry next loop
+                continue
             try:
                 tx_time = LoRa.transmitTime()
                 rate = LoRa.dataRate()
@@ -130,10 +133,8 @@ try:
         except Exception as e:
             print("[ERROR] send failed:", e)
             hard_reset_lora()
-            continue  # Skip further waits when failed
-        # ---- Keep precise 1s interval ----
-        while time.time() - last_send < 1.0:
-            time.sleep(0.01)
+            continue
+        last_send = now
 except KeyboardInterrupt:
     print("Stopped by user")
     LoRa.end()
