@@ -5,8 +5,8 @@ from LoRaRF import SX126x
 
 # ---------------- GPIO FIX ----------------
 GPIO.setwarnings(False)
-GPIO.cleanup()              # reset any old state
-GPIO.setmode(GPIO.BCM)      # BCM mode before LoRa init
+GPIO.cleanup()
+GPIO.setmode(GPIO.BCM)
 
 # ---------------- GPS SETUP ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
@@ -24,7 +24,6 @@ def nmea_to_decimal(raw, hemi, is_lat=True):
         return None
 
 def parse_nmea(line):
-    """Return (lat, lon, speed_kmh) from NMEA if valid"""
     if not line:
         return None, None, None
     parts = line.split(",")
@@ -33,8 +32,7 @@ def parse_nmea(line):
             lat = nmea_to_decimal(parts[3], parts[4], True)
             lon = nmea_to_decimal(parts[5], parts[6], False)
             speed_knots = float(parts[7]) if parts[7] else 0.0
-            speed_kmh = speed_knots * 1.852
-            return lat, lon, speed_kmh
+            return lat, lon, speed_knots * 1.852
         elif (line.startswith("$GPGGA") or line.startswith("$GNGGA")) and len(parts) > 6:
             if parts[6] and int(parts[6]) > 0:
                 lat = nmea_to_decimal(parts[2], parts[3], True)
@@ -54,10 +52,21 @@ def init_lora():
     LoRa.setDio2RfSwitch()
     LoRa.setFrequency(865000000)
     LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-    LoRa.setLoRaModulation(7, 125000, 5)             # SF7, 125kHz, CR=4/5
-    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)  # CRC ON
+    LoRa.setLoRaModulation(7, 125000, 5)
+    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
     LoRa.setSyncWord(0x3444)
 
+def hard_reset_lora():
+    """Pulse reset pin to recover instantly (<200 ms)"""
+    GPIO.setup(resetPin, GPIO.OUT)
+    GPIO.output(resetPin, GPIO.LOW)
+    time.sleep(0.01)
+    GPIO.output(resetPin, GPIO.HIGH)
+    time.sleep(0.05)
+    init_lora()
+    print("[RESET] Hard reset done in <0.2s")
+
+# Init once
 init_lora()
 print("[LoRa] ready, press Ctrl+C to stop.")
 
@@ -73,13 +82,15 @@ try:
         except Exception:
             lat, lon, speed = None, None, None
 
+        if gps.in_waiting > 1000:
+            gps.reset_input_buffer()
+
         now = time.time()
         timestamp = time.strftime("%H:%M:%S", time.localtime(now))
 
         if lat is not None and lon is not None:
             counter += 1
-            speed_kmh = speed if speed is not None else 0.0
-            msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{speed_kmh:.1f}km/h"
+            msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
             last_send = now
         elif now - last_send > 10:
             counter += 1
@@ -92,25 +103,20 @@ try:
         try:
             LoRa.beginPacket()
             LoRa.write(data, len(data))
-            LoRa.endPacket(False)   # non-blocking
+            LoRa.endPacket(False)
 
-            # --- watchdog wait ---
             ok = False
             t0 = time.time()
-            while time.time() - t0 < 2:   # max 2s wait
+            while time.time() - t0 < 2:
                 if LoRa.wait(100):
                     ok = True
                     break
                 time.sleep(0.05)
 
             if not ok:
-                print("[WARN] TX timeout → soft reset LoRa")
-                # ✅ soft recovery instead of full init
-                LoRa.standby()
-                LoRa.setLoRaModulation(7, 125000, 5)
-                LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
+                print("[WARN] TX timeout → HARD RESET")
+                hard_reset_lora()
 
-            # --- metrics ---
             try:
                 tx_time = LoRa.transmitTime()
                 rate = LoRa.dataRate()
@@ -120,12 +126,8 @@ try:
 
         except Exception as e:
             print("[ERROR] send failed:", e)
-            # ✅ soft reset here also
-            LoRa.standby()
-            LoRa.setLoRaModulation(7, 125000, 5)
-            LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
+            hard_reset_lora()
 
-        # short delay (safe for 1 Hz or faster)
         time.sleep(1)
 
 except KeyboardInterrupt:
