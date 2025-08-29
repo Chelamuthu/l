@@ -25,7 +25,7 @@ def nmea_to_decimal(raw, hemi, is_lat=True):
 
 def parse_nmea(line):
     """Return (lat, lon, speed_kmh) from NMEA if valid"""
-    if not line: 
+    if not line:
         return None, None, None
     parts = line.split(",")
     try:
@@ -49,14 +49,13 @@ busId=0; csId=0; resetPin=18; busyPin=20; irqPin=-1; txenPin=6; rxenPin=-1
 LoRa = SX126x()
 
 def init_lora():
-    GPIO.setmode(GPIO.BCM)   # make sure mode is set again before driver init
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
         raise SystemExit("LoRa init failed")
     LoRa.setDio2RfSwitch()
     LoRa.setFrequency(865000000)      # adjust for your band
     LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-    LoRa.setLoRaModulation(7,125000,5)
-    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
+    LoRa.setLoRaModulation(7, 125000, 5)   # SF7, 125kHz, CR=4/5
+    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)  # CRC enabled
     LoRa.setSyncWord(0x3444)
 
 init_lora()
@@ -93,22 +92,7 @@ try:
         try:
             LoRa.beginPacket()
             LoRa.write(data, len(data))
-            LoRa.endPacket(False)  # non-blocking
-
-            # --- Controlled wait with watchdog ---
-            ok = False
-            t0 = time.time()
-            while time.time() - t0 < 2:   # max 2s wait
-                if LoRa.wait(100):
-                    ok = True
-                    break
-                time.sleep(0.05)
-
-            if not ok:
-                print("[WARN] TX timeout → resetting LoRa")
-                LoRa.end()
-                time.sleep(0.5)
-                init_lora()
+            LoRa.endPacket(True)   # ✅ blocking send, guaranteed done
 
             # --- Print metrics ---
             try:
@@ -120,11 +104,9 @@ try:
 
         except Exception as e:
             print("[ERROR] send failed:", e)
-            LoRa.end()
-            time.sleep(1)
-            init_lora()
 
-        time.sleep(1)
+        # small safe delay (adjustable)
+        time.sleep(1)   # can lower to 0.1s if needed
 
 except KeyboardInterrupt:
     print("Stopped by user")
