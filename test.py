@@ -1,90 +1,56 @@
-import os, sys, time, serial
-currentdir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(os.path.dirname(os.path.dirname(currentdir)))
+import serial
+import time
 from LoRaRF import SX126x
 
-# --- LoRa Setup ---
+# ---------------- LoRa Setup ----------------
 busId = 0; csId = 0
-resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1
+resetPin = 18; busyPin = 20
+irqPin = -1; txenPin = 6; rxenPin = -1
 
-LoRa = SX126x()
-print("Begin LoRa radio")
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Can't begin LoRa radio")
+lora = SX126x()
+print("Initializing LoRa...")
+if not lora.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
+    print("LoRa init failed!")
+    exit(1)
 
-LoRa.setDio2RfSwitch()
-LoRa.setFrequency(865000000)  # India frequency band
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
+lora.setFrequency(868000000)   # Change to your module band (868/915/433 MHz)
+lora.setTxPower(22, 0)
+lora.setSpreadingFactor(7)
+lora.setBandwidth(125000)
+lora.setCodingRate(5)
 
-# Dynamic payload (0 = auto size, avoids hangs)
-headerType = LoRa.HEADER_EXPLICIT
-preambleLength = 12
-payloadLength = 0
-crcType = True
-LoRa.setLoRaPacket(headerType, preambleLength, payloadLength, crcType)
-LoRa.setSyncWord(0x3444)
+# ---------------- GNSS Setup ----------------
+# GNSS is usually connected via UART (check Waveshare doc for exact port, often /dev/ttyAMA0 or /dev/serial0)
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
-# --- GNSS Setup ---
-# On Waveshare board, GNSS is usually at /dev/ttyS0 or /dev/ttyAMA0
-try:
-    gnss = serial.Serial("/dev/ttyS0", baudrate=9600, timeout=1)
-except Exception as e:
-    raise Exception(f"Could not open GNSS serial port: {e}")
+def parse_gps(data):
+    """Extract lat/lon from NMEA sentence $GPGGA or $GPRMC"""
+    if data.startswith("$GPRMC"):
+        parts = data.split(",")
+        if parts[2] == "A":  # A = valid
+            lat_raw = parts[3]
+            lat_dir = parts[4]
+            lon_raw = parts[5]
+            lon_dir = parts[6]
 
-print("\n-- LoRa GNSS Transmitter --\n")
-
-counter = 0
-
-def get_gnss_sentence():
-    """Read one valid GNSS NMEA sentence from module."""
-    try:
-        line = gnss.readline().decode('utf-8', errors='ignore').strip()
-        if line.startswith("$GNRMC") or line.startswith("$GPGGA"):
-            return line
-    except:
-        return None
+            # Convert from ddmm.mmmm to decimal degrees
+            lat = float(lat_raw[:2]) + float(lat_raw[2:]) / 60.0
+            lon = float(lon_raw[:3]) + float(lon_raw[3:]) / 60.0
+            if lat_dir == "S": lat = -lat
+            if lon_dir == "W": lon = -lon
+            return lat, lon
     return None
 
-try:
-    while True:
-        nmea = get_gnss_sentence()
-        if nmea:
-            payload = f"{nmea} CNT:{counter}"
-            data = [ord(c) for c in payload]
-
-            try:
-                LoRa.beginPacket()
-                LoRa.write(data, len(data))
-                LoRa.endPacket()
-
-                # Wait with timeout (prevents hang)
-                if not LoRa.wait(timeout=2000):
-                    print("⚠️ TX timeout, resetting LoRa")
-                    LoRa.end()
-                    time.sleep(0.5)
-                    LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin)
-
-                print(f"Sent GNSS: {payload}")
-                print("TX time: {:.2f} ms | Rate: {:.2f} B/s".format(
-                    LoRa.transmitTime(), LoRa.dataRate()
-                ))
-
-            except Exception as e:
-                print(f"❌ Error sending packet: {e}")
-                LoRa.end()
-                time.sleep(1)
-                LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin)
-
-            counter = (counter + 1) % 256
-            time.sleep(2)  # don’t overload LoRa
-        else:
-            # If no GNSS fix/data, just wait
-            print("No GNSS data yet...")
-            time.sleep(1)
-
-except KeyboardInterrupt:
-    print("Stopping transmitter...")
-finally:
-    LoRa.end()
-    gnss.close()
+# ---------------- Main Loop ----------------
+while True:
+    try:
+        line = gps.readline().decode("ascii", errors="replace").strip()
+        coords = parse_gps(line)
+        if coords:
+            lat, lon = coords
+            message = f"Lat:{lat:.6f}, Lon:{lon:.6f}"
+            print("Sending:", message)
+            lora.send(message.encode())
+            time.sleep(5)  # send every 5 seconds
+    except Exception as e:
+        print("Error:", e)
