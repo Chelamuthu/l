@@ -4,7 +4,6 @@ import RPi.GPIO as GPIO
 from LoRaRF import SX126x
 
 # ---------------- GPIO FIX ----------------
-# BCM mode matches pins 18, 20, 6 you used
 GPIO.setmode(GPIO.BCM)
 
 # ---------------- GPS SETUP ----------------
@@ -46,15 +45,17 @@ def parse_nmea(line):
 # ---------------- LORA SETUP ----------------
 busId=0; csId=0; resetPin=18; busyPin=20; irqPin=-1; txenPin=6; rxenPin=-1
 LoRa = SX126x()
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise SystemExit("LoRa init failed")
-LoRa.setDio2RfSwitch()
-LoRa.setFrequency(865000000)      # adjust for your band
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-LoRa.setLoRaModulation(7,125000,5)
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
-LoRa.setSyncWord(0x3444)
+def init_lora():
+    if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
+        raise SystemExit("LoRa init failed")
+    LoRa.setDio2RfSwitch()
+    LoRa.setFrequency(865000000)      # adjust for your band
+    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
+    LoRa.setLoRaModulation(7,125000,5)
+    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
+    LoRa.setSyncWord(0x3444)
 
+init_lora()
 print("[LoRa] ready, press Ctrl+C to stop.")
 
 # ---------------- MAIN LOOP ----------------
@@ -88,30 +89,22 @@ try:
         try:
             LoRa.beginPacket()
             LoRa.write(data, len(data))
-            LoRa.endPacket()
+            LoRa.endPacket(False)  # non-blocking
 
-            # protect against hang
+            # --- Controlled wait with watchdog ---
             ok = False
             t0 = time.time()
             while time.time() - t0 < 2:   # max 2s wait
-                try:
-                    if LoRa.wait(100):   # small timeout step
-                        ok = True
-                        break
-                except Exception:
-                    time.sleep(0.05)
+                if LoRa.wait(100):
+                    ok = True
+                    break
+                time.sleep(0.05)
 
             if not ok:
                 print("[WARN] TX timeout → resetting LoRa")
                 LoRa.end()
                 time.sleep(0.5)
-                LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin)
-                LoRa.setDio2RfSwitch()
-                LoRa.setFrequency(865000000)
-                LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-                LoRa.setLoRaModulation(7,125000,5)
-                LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT,12,0,True)
-                LoRa.setSyncWord(0x3444)
+                init_lora()
 
             # --- Print metrics ---
             try:
@@ -123,7 +116,9 @@ try:
 
         except Exception as e:
             print("[ERROR] send failed:", e)
+            LoRa.end()
             time.sleep(1)
+            init_lora()
 
         time.sleep(1)
 
