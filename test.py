@@ -5,7 +5,6 @@ from LoRaRF import SX126x
 
 # ---------------- GPIO FIX ----------------
 GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
 
 # ---------------- GPS SETUP ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
@@ -46,17 +45,14 @@ def parse_nmea(line):
 # ---------------- LORA SETUP ----------------
 busId=0; csId=0; resetPin=18; busyPin=20; irqPin=-1; txenPin=6; rxenPin=-1
 LoRa = SX126x()
-
 def init_lora():
-    print("[INFO] Initializing LoRa...")
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
         raise SystemExit("LoRa init failed")
-
     LoRa.setDio2RfSwitch()
-    LoRa.setFrequency(865000000)         # match RX
+    LoRa.setFrequency(865000000)      # adjust for your band
     LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-    LoRa.setLoRaModulation(7, 125000, 5)
-    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 255, True)
+    LoRa.setLoRaModulation(7,125000,5)
+    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
     LoRa.setSyncWord(0x3444)
 
 init_lora()
@@ -82,31 +78,49 @@ try:
             speed_kmh = speed if speed is not None else 0.0
             msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{speed_kmh:.1f}km/h"
             last_send = now
-        elif now - last_send > 10:  # no fix for 10s → send keepalive
+        elif now - last_send > 10:  # no fix for 10s → still send keepalive
             counter += 1
             msg = f"{counter},{timestamp},NO_FIX"
             last_send = now
         else:
-            continue   # wait until we have new data
+            continue   # don’t spam too fast when no fix
 
         data = list(msg.encode())
-
         try:
-            # Blocking TX → no hang
             LoRa.beginPacket()
             LoRa.write(data, len(data))
-            LoRa.endPacket(True)   # ✅ wait until TX done
+            LoRa.endPacket(False)  # non-blocking
 
-            print(f"[SENT] {msg} | {len(data)}B")
+            # --- Controlled wait with watchdog ---
+            ok = False
+            t0 = time.time()
+            while time.time() - t0 < 2:   # max 2s wait
+                if LoRa.wait(100):
+                    ok = True
+                    break
+                time.sleep(0.05)
+
+            if not ok:
+                print("[WARN] TX timeout → resetting LoRa")
+                LoRa.end()
+                time.sleep(0.5)
+                init_lora()
+
+            # --- Print metrics ---
+            try:
+                tx_time = LoRa.transmitTime()   # ms
+                rate = LoRa.dataRate()          # B/s
+                print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.2f} B/s")
+            except Exception:
+                print(f"[SENT] {msg} | {len(data)}B")
 
         except Exception as e:
-            print("[ERROR] TX failed:", e)
-            # reset LoRa chip and continue
+            print("[ERROR] send failed:", e)
             LoRa.end()
             time.sleep(1)
             init_lora()
 
-        time.sleep(2)
+        time.sleep(1)
 
 except KeyboardInterrupt:
     print("Stopped by user")
