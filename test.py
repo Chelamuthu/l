@@ -92,13 +92,12 @@ try:
             counter += 1
             msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
             last_send = now
-        elif now - last_send > 10:  # No fix for 10s → still send NO_FIX
+        elif now - last_send > 10:
             counter += 1
             msg = f"{counter},{timestamp},NO_FIX"
             last_send = now
         else:
-            time.sleep(0.1)
-            continue
+            continue  # skip if no fix and under 10s
 
         data = list(msg.encode())
         try:
@@ -106,14 +105,14 @@ try:
             LoRa.write(data, len(data))
             LoRa.endPacket(False)
 
-            # Wait for TX confirmation (max 2s)
+            # Fast TX confirmation (max 300 ms)
             ok = False
             t0 = time.time()
-            while time.time() - t0 < 2:
-                if LoRa.wait(100):
+            while time.time() - t0 < 0.3:
+                if LoRa.wait(50):
                     ok = True
                     break
-                time.sleep(0.05)
+                time.sleep(0.01)
 
             if not ok:
                 print("[WARN] TX timeout → HARD RESET")
@@ -130,8 +129,9 @@ try:
             print("[ERROR] send failed:", e)
             hard_reset_lora()
 
-        # Always send once per second
-        time.sleep(1)
+        # Keep precise 1s loop
+        while time.time() - last_send < 1.0:
+            time.sleep(0.01)
 
 except KeyboardInterrupt:
     print("Stopped by user")
