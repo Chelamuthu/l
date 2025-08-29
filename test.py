@@ -9,7 +9,7 @@ GPIO.cleanup()
 GPIO.setmode(GPIO.BCM)
 
 # GPS Setup
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=0.1)  # non-blocking
 
 def nmea_to_decimal(raw, hemi, is_lat=True):
     try:
@@ -59,7 +59,7 @@ def init_lora():
     LoRa.setDio2RfSwitch()
     LoRa.setFrequency(865000000)
     LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-    LoRa.setLoRaModulation(7, 125000, 5)
+    LoRa.setLoRaModulation(7, 125000, 5)  # SF7, BW125, CR4/5
     LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
     LoRa.setSyncWord(0x3444)
 
@@ -70,7 +70,7 @@ def hard_reset_lora():
     GPIO.output(resetPin, GPIO.HIGH)
     time.sleep(0.05)
     init_lora()
-    print("[RESET] Hard reset done in <0.2s")
+    print("[RESET] Hard reset done")
 
 init_lora()
 print("[LoRa] ready, press Ctrl+C to stop.")
@@ -86,53 +86,53 @@ try:
             time.sleep(next_send - now)
             now = next_send
 
-        # Read GPS data quickly
+        # ---- Read GPS (non-blocking) ----
+        lat = lon = speed = None
         try:
             raw_line = gps.readline().decode("ascii", "ignore").strip()
-            lat, lon, speed = parse_nmea(raw_line)
+            if raw_line:
+                lat, lon, speed = parse_nmea(raw_line)
         except Exception:
-            lat, lon, speed = None, None, None
-        
-        if gps.in_waiting > 1000:
+            pass
+
+        if gps.in_waiting > 2000:
             gps.reset_input_buffer()
 
         timestamp = time.strftime("%H:%M:%S", time.localtime(now))
-        send_data = False
+
+        # ---- Build message ----
+        counter += 1
         if lat is not None and lon is not None:
-            counter += 1
             msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
-            send_data = True
         else:
-            # Optionally send NO_FIX if you want every second guaranteed
-            counter += 1
             msg = f"{counter},{timestamp},NO_FIX"
-            send_data = True
 
-        if send_data:
-            data = list(msg.encode())
+        data = list(msg.encode())
 
-            try:
-                LoRa.beginPacket()
-                LoRa.write(data, len(data))
-                LoRa.endPacket(False)
+        # ---- Send LoRa ----
+        try:
+            LoRa.beginPacket()
+            LoRa.write(data, len(data))
+            LoRa.endPacket(False)
 
-                # Check TX success quickly with a tight 10 ms timeout
-                if not LoRa.wait(10):
-                    print("[WARN] TX failed → instant HARD RESET")
-                    hard_reset_lora()
-                else:
-                    try:
-                        tx_time = LoRa.transmitTime()
-                        rate = LoRa.dataRate()
-                        print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.2f} B/s")
-                    except Exception:
-                        print(f"[SENT] {msg} | {len(data)}B")
-            except Exception as e:
-                print("[ERROR] send failed:", e)
+            # allow enough time for TX (50–300ms depending on SF)
+            if not LoRa.wait(200):
+                print("[WARN] TX timeout → reset")
                 hard_reset_lora()
+            else:
+                try:
+                    tx_time = LoRa.transmitTime()
+                    rate = LoRa.dataRate()
+                    print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.2f} B/s")
+                except Exception:
+                    print(f"[SENT] {msg} | {len(data)}B")
 
-        # Schedule next send exactly 1 second later, no matter what
-        next_send += period
+        except Exception as e:
+            print("[ERROR] send failed:", e)
+            hard_reset_lora()
+
+        # ---- Schedule next packet ----
+        next_send = time.time() + period
 
 except KeyboardInterrupt:
     print("Stopped by user")
