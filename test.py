@@ -50,11 +50,11 @@ def init_lora():
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
         raise SystemExit("LoRa init failed")
     LoRa.setDio2RfSwitch()
-    LoRa.setFrequency(865000000)
-    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-    LoRa.setLoRaModulation(7, 125000, 5)
+    LoRa.setFrequency(865000000)                  # Match RX frequency
+    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)     # 22 dBm output
+    LoRa.setLoRaModulation(7, 125000, 5)          # SF7 BW125 CR4/5
     LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
-    LoRa.setSyncWord(0x3444)
+    LoRa.setSyncWord(0x3444)                      # Must match RX sync word
 
 def hard_reset_lora():
     """Pulse reset pin to recover instantly (<200 ms)"""
@@ -92,11 +92,12 @@ try:
             counter += 1
             msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
             last_send = now
-        elif now - last_send > 10:
+        elif now - last_send > 10:  # No fix for 10s → still send NO_FIX
             counter += 1
             msg = f"{counter},{timestamp},NO_FIX"
             last_send = now
         else:
+            time.sleep(0.1)
             continue
 
         data = list(msg.encode())
@@ -105,6 +106,7 @@ try:
             LoRa.write(data, len(data))
             LoRa.endPacket(False)
 
+            # Wait for TX confirmation (max 2s)
             ok = False
             t0 = time.time()
             while time.time() - t0 < 2:
@@ -128,6 +130,7 @@ try:
             print("[ERROR] send failed:", e)
             hard_reset_lora()
 
+        # Always send once per second
         time.sleep(1)
 
 except KeyboardInterrupt:
