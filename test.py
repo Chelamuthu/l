@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 import time, serial
+import RPi.GPIO as GPIO
 from LoRaRF import SX126x
+
+# ---------------- GPIO FIX ----------------
+# BCM mode matches pins 18, 20, 6 you used
+GPIO.setmode(GPIO.BCM)
 
 # ---------------- GPS SETUP ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
@@ -126,3 +131,4 @@ except KeyboardInterrupt:
     print("Stopped by user")
     LoRa.end()
     gps.close()
+    GPIO.cleanup()
