@@ -3,12 +3,12 @@ import time, serial
 import RPi.GPIO as GPIO
 from LoRaRF import SX126x
 
-# ---------------- GPIO FIX ----------------
+# GPIO Setup
 GPIO.setwarnings(False)
 GPIO.cleanup()
 GPIO.setmode(GPIO.BCM)
 
-# ---------------- GPS SETUP ----------------
+# GPS Setup
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
 def nmea_to_decimal(raw, hemi, is_lat=True):
@@ -30,8 +30,8 @@ def parse_nmea(line):
         return None, None, None
     parts = line.split(",")
     try:
-        if line.startswith("$GPRMC") and len(parts) > 7 and parts[11] == "A":
-            lat = nmea_to_decimal(parts[12], parts[4], True)
+        if line.startswith("$GPRMC") and len(parts) > 7 and parts[10] == "A":
+            lat = nmea_to_decimal(parts[11], parts[12], True)
             lon = nmea_to_decimal(parts[5], parts[6], False)
             speed_knots = float(parts[7]) if parts[7] else 0.0
             return lat, lon, speed_knots * 1.852  # km/h
@@ -44,7 +44,7 @@ def parse_nmea(line):
         pass
     return None, None, None
 
-# ---------------- LORA SETUP ----------------
+# LoRa Setup
 busId = 0
 csId = 0
 resetPin = 18
@@ -60,11 +60,11 @@ def init_lora():
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
         raise SystemExit("LoRa init failed")
     LoRa.setDio2RfSwitch()
-    LoRa.setFrequency(865000000)                  # Match RX frequency
-    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)     # 22 dBm
-    LoRa.setLoRaModulation(7, 125000, 5)          # SF7, BW125, CR4/5
+    LoRa.setFrequency(865000000)
+    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
+    LoRa.setLoRaModulation(7, 125000, 5)
     LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
-    LoRa.setSyncWord(0x3444)                      # Must match RX sync word
+    LoRa.setSyncWord(0x3444)
 
 def hard_reset_lora():
     """Pulse reset pin to recover instantly (<0.2s)"""
@@ -79,19 +79,18 @@ def hard_reset_lora():
 init_lora()
 print("[LoRa] ready, press Ctrl+C to stop.")
 
-# ---------------- MAIN LOOP ----------------
+# Main loop (Precise 1s TX without drift or delay)
 last_send = time.time()
 counter = 0
 try:
     while True:
-        # Precise interval: wait until 1s after last_send
         now = time.time()
         sleep_time = last_send + 1.0 - now
         if sleep_time > 0:
             time.sleep(sleep_time)
         now = time.time()
 
-        # ---- Read GPS ----
+        # --- Read GPS ---
         try:
             raw_line = gps.readline().decode("ascii", "ignore").strip()
             lat, lon, speed = parse_nmea(raw_line)
@@ -100,8 +99,8 @@ try:
         if gps.in_waiting > 1000:
             gps.reset_input_buffer()
         timestamp = time.strftime("%H:%M:%S", time.localtime(now))
-        
-        # ---- Build message ----
+
+        # --- Build message ---
         send_data = False
         if lat is not None and lon is not None:
             counter += 1
@@ -113,9 +112,9 @@ try:
             send_data = True
         if not send_data:
             continue
-        
+
         data = list(msg.encode())
-        # ---- Send LoRa instantly ----
+        # --- Send LoRa, check TX status instantly ---
         try:
             LoRa.beginPacket()
             LoRa.write(data, len(data))
