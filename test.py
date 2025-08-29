@@ -5,6 +5,7 @@ from LoRaRF import SX126x
 
 # ---------------- GPIO FIX ----------------
 GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 
 # ---------------- GPS SETUP ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
@@ -45,7 +46,9 @@ def parse_nmea(line):
 # ---------------- LORA SETUP ----------------
 busId=0; csId=0; resetPin=18; busyPin=20; irqPin=-1; txenPin=6; rxenPin=-1
 LoRa = SX126x()
+
 def init_lora():
+    print("[INFO] Initializing LoRa...")
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
         raise SystemExit("LoRa init failed")
     LoRa.setDio2RfSwitch()
@@ -89,22 +92,7 @@ try:
         try:
             LoRa.beginPacket()
             LoRa.write(data, len(data))
-            LoRa.endPacket(False)  # non-blocking
-
-            # --- Controlled wait with watchdog ---
-            ok = False
-            t0 = time.time()
-            while time.time() - t0 < 2:   # max 2s wait
-                if LoRa.wait(100):
-                    ok = True
-                    break
-                time.sleep(0.05)
-
-            if not ok:
-                print("[WARN] TX timeout → resetting LoRa")
-                LoRa.end()
-                time.sleep(0.5)
-                init_lora()
+            LoRa.endPacket(True)   # ✅ blocking → wait until TX done
 
             # --- Print metrics ---
             try:
