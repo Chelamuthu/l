@@ -30,12 +30,14 @@ def parse_nmea(line):
         return None, None, None
     parts = line.split(",")
     try:
-        if line.startswith("$GPRMC") and len(parts) > 7 and parts[10] == "A":
-            lat = nmea_to_decimal(parts[11], parts[12], True)
+        # Correct GPRMC parsing: parts[2] == "A" means active fix according to NMEA standard
+        if line.startswith("$GPRMC") and len(parts) > 7 and parts[2] == "A":
+            lat = nmea_to_decimal(parts[3], parts[4], True)
             lon = nmea_to_decimal(parts[5], parts[6], False)
             speed_knots = float(parts[7]) if parts[7] else 0.0
-            return lat, lon, speed_knots * 1.852  # km/h
+            return lat, lon, speed_knots * 1.852  # convert knots to km/h
         elif (line.startswith("$GPGGA") or line.startswith("$GNGGA")) and len(parts) > 6:
+            # fix quality > 0 means valid fix
             if parts[6] and int(parts[6]) > 0:
                 lat = nmea_to_decimal(parts[2], parts[3], True)
                 lon = nmea_to_decimal(parts[4], parts[5], False)
@@ -79,9 +81,9 @@ def hard_reset_lora():
 init_lora()
 print("[LoRa] ready, press Ctrl+C to stop.")
 
-# Main loop (Precise 1s TX without drift or delay)
 last_send = time.time()
 counter = 0
+
 try:
     while True:
         now = time.time()
@@ -90,50 +92,58 @@ try:
             time.sleep(sleep_time)
         now = time.time()
 
-        # --- Read GPS ---
+        # Read GPS
         try:
             raw_line = gps.readline().decode("ascii", "ignore").strip()
             lat, lon, speed = parse_nmea(raw_line)
         except Exception:
             lat, lon, speed = None, None, None
+        
         if gps.in_waiting > 1000:
             gps.reset_input_buffer()
+        
         timestamp = time.strftime("%H:%M:%S", time.localtime(now))
 
-        # --- Build message ---
         send_data = False
         if lat is not None and lon is not None:
             counter += 1
             msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
             send_data = True
-        elif now - last_send > 10:  # no fix >10s → still send
+        elif now - last_send > 10:  # if no fix for >10 sec, send NO_FIX
             counter += 1
             msg = f"{counter},{timestamp},NO_FIX"
             send_data = True
+        
         if not send_data:
             continue
 
         data = list(msg.encode())
-        # --- Send LoRa, check TX status instantly ---
+
         try:
             LoRa.beginPacket()
             LoRa.write(data, len(data))
             LoRa.endPacket(False)
-            if not LoRa.wait(10):  # Only wait 10 ms max
+
+            # Wait max 10ms for TX success, then immediately reset on failure
+            if not LoRa.wait(10):
                 print("[WARN] TX failed → instant HARD RESET")
                 hard_reset_lora()
                 continue
+
             try:
                 tx_time = LoRa.transmitTime()
                 rate = LoRa.dataRate()
                 print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.2f} B/s")
             except Exception:
                 print(f"[SENT] {msg} | {len(data)}B")
+
         except Exception as e:
             print("[ERROR] send failed:", e)
             hard_reset_lora()
             continue
+
         last_send = now
+
 except KeyboardInterrupt:
     print("Stopped by user")
     LoRa.end()
