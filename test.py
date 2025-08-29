@@ -21,7 +21,7 @@ lora = SX126x(spi, NSS, RESET, BUSY, DIO1)
 
 print("Configuring LoRa...")
 lora.begin()
-lora.setFrequency(868000000)
+lora.setFrequency(865000000)
 lora.setTxPower(22, lora.TX_POWER_SX1262)
 lora.setSpreadingFactor(7)
 lora.setBandwidth(125000)
