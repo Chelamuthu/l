@@ -1,111 +1,78 @@
-import os, sys
+#!/usr/bin/env python3
 import time
 import serial
 from LoRaRF import SX126x
 
-# ---------- LoRa setup ----------
-busId = 0; csId = 0
-resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1
-LoRa = SX126x()
-print("Begin LoRa radio")
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Something wrong, can't begin LoRa radio")
+# ---------------- GPS Setup ----------------
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
-LoRa.setDio2RfSwitch()
-LoRa.setFrequency(865000000)                 # 865–867 MHz (India ISM band)
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 128, True)  
-LoRa.setSyncWord(0x3444)
+# ---------------- LoRa Setup ----------------
+lora = SX126x()
+lora.begin()
+lora.setFrequency(868000000)  # Adjust frequency as per your module
+lora.setTxPower(22)
+lora.setLoRaModulation(bw=125000, sf=7, cr=5)
+lora.setLoRaPacket(preambleLength=12,
+                   headerType=lora.HEADER_EXPLICIT,
+                   payloadLength=255,
+                   crcType=lora.CRC_ON,
+                   invertIQ=lora.IQ_STANDARD)
 
-print("\n-- LoRa GNSS Transmitter --\n")
-
-# ---------- GNSS setup ----------
-GNSS_PORT = "/dev/ttyAMA0"       
-GNSS_BAUD = 9600
-
-try:
-    gps_serial = serial.Serial(GNSS_PORT, GNSS_BAUD, timeout=1)
-    print(f"Opened GNSS on {GNSS_PORT}")
-except Exception as e:
-    print("Error opening GNSS:", e)
-    gps_serial = None
-
-# ---------- Helpers ----------
-def convert_lat_lon(lat_str, ns, lon_str, ew):
-    """Convert NMEA ddmm.mmmm to decimal degrees"""
-    if not lat_str or not lon_str or ns not in ("N","S") or ew not in ("E","W"):
-        return None, None
+# ---------------- Helpers ----------------
+def nmea_to_decimal(raw, hemi, is_lat=True):
     try:
-        # Latitude (2° digits)
-        lat_deg = float(lat_str[:2])
-        lat_min = float(lat_str[2:])
-        lat = lat_deg + lat_min / 60.0
-        if ns == "S": lat = -lat
-
-        # Longitude (3° digits)
-        lon_deg = float(lon_str[:3])
-        lon_min = float(lon_str[3:])
-        lon = lon_deg + lon_min / 60.0
-        if ew == "W": lon = -lon
-
-        return lat, lon
+        raw_val = float(raw)
+        if is_lat:
+            deg = int(raw_val / 100)
+            minutes = raw_val - deg * 100
+            decimal = deg + minutes / 60
+        else:
+            deg = int(raw_val / 100)
+            minutes = raw_val - deg * 100
+            decimal = deg + minutes / 60
+        if hemi in ["S", "W"]:
+            decimal = -decimal
+        return round(decimal, 6)
     except:
-        return None, None
+        return None
 
-def is_rmc(sentence):
-    return sentence.startswith("$") and sentence[3:6] == "RMC"
+def parse_gprmc(nmea):
+    parts = nmea.split(",")
+    if parts[0].endswith("RMC") and parts[2] == "A":  # Valid fix
+        lat = nmea_to_decimal(parts[3], parts[4], True)
+        lon = nmea_to_decimal(parts[5], parts[6], False)
+        speed = float(parts[7]) * 1.852  # knots → km/h
+        return lat, lon, round(speed, 2)
+    return None, None, None
 
+# ---------------- Main Loop ----------------
 counter = 0
-last_fix = None
 
+print("LoRa GNSS Transmitter Started...")
 while True:
-    latitude = longitude = speed_kmh = None
-
     try:
-        line = gps_serial.readline().decode("utf-8", errors="ignore").strip() if gps_serial else ""
-        
-        # -------- Parse RMC: lat, lon, speed --------
-        if is_rmc(line):
-            parts = line.split(",")
-            if len(parts) >= 9 and parts[2] == "A":   # 'A' = valid fix
-                lat, lon = convert_lat_lon(parts[3], parts[4], parts[5], parts[6])
-                if lat is not None and lon is not None:
-                    latitude, longitude = lat, lon
-                try:
-                    if parts[7] != "":  # speed in knots -> km/h
-                        speed_kmh = float(parts[7]) * 1.852
-                except:
-                    pass
+        line = gps.readline().decode("utf-8", errors="ignore").strip()
+        if line.startswith("$GPRMC"):
+            lat, lon, speed = parse_gprmc(line)
+            if lat and lon:
+                timestamp = time.strftime("%H:%M:%S")
+                message = (f"Latitude: {lat}, Longitude: {lon}, "
+                           f"Speed: {speed} km/h, "
+                           f"Counter: {counter}, Time: {timestamp}")
+
+                # Send over LoRa
+                lora.beginPacket()
+                lora.print(message)
+                lora.endPacket()
+
+                # Print exactly what is sent
+                print("Transmitting ->", message)
+
+                # Update counter (0–255 rollover)
+                counter = (counter + 1) % 256
+                time.sleep(1)  # 1s interval
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+        break
     except Exception as e:
-        print("GPS parse error:", e)
-
-    # Fallback to last known fix
-    if latitude is None or longitude is None:
-        if last_fix:
-            latitude, longitude, speed_kmh = last_fix
-    else:
-        last_fix = (latitude, longitude, speed_kmh)
-
-    # -------- Build & send LoRa message --------
-    if latitude is not None and longitude is not None:
-        spd_txt = f"{speed_kmh:.2f}" if isinstance(speed_kmh, (int,float)) else "0.00"
-        message = f"{latitude:.6f},{longitude:.6f},{spd_txt},{counter}"
-    else:
-        message = f"NO_FIX,{counter}"
-
-    try:
-        payload = [ord(c) for c in message]
-        LoRa.beginPacket()
-        LoRa.write(payload, len(payload))
-        LoRa.endPacket()
-        LoRa.wait()
-
-        print(f"Sent: {message}")
-        print("Transmit time: {0:0.2f} ms | Data rate: {1:0.2f} byte/s"
-              .format(LoRa.transmitTime(), LoRa.dataRate()))
-    except Exception as e:
-        print("LoRa send error:", e)
-
-    time.sleep(1.0)   # send every 1 second
-    counter = (counter + 1) % 256
+        print("Error:", e)
