@@ -1,78 +1,62 @@
 #!/usr/bin/env python3
-import time, serial
+import serial
+import time
 from LoRaRF import SX126x
+import RPi.GPIO as GPIO
+
+# ---------------- GPIO Setup ----------------
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.cleanup()
 
 # ---------------- GPS Setup ----------------
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=0.5)
-gps.reset_input_buffer()
-
-def parse_nmea(sentence):
-    """Extract latitude & longitude from NMEA GGA/RMC sentences"""
-    try:
-        parts = sentence.split(",")
-        if len(parts) < 6:
-            return None
-        if parts[0] in ["$GPGGA", "$GNGGA", "$GPRMC", "$GNRMC"]:
-            lat_raw, lat_hemi, lon_raw, lon_hemi = parts[2], parts[3], parts[4], parts[5]
-            if lat_raw and lon_raw:
-                # Convert NMEA to decimal degrees
-                lat = float(lat_raw[:2]) + float(lat_raw[2:]) / 60.0
-                lon = float(lon_raw[:3]) + float(lon_raw[3:]) / 60.0
-                if lat_hemi == "S":
-                    lat = -lat
-                if lon_hemi == "W":
-                    lon = -lon
-                return lat, lon
-    except Exception:
-        pass
-    return None
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
 # ---------------- LoRa Setup ----------------
-busId, csId = 0, 0
-resetPin, busyPin, irqPin, txenPin, rxenPin = 18, 20, -1, 6, -1
+lora = SX126x()
+lora.begin()
+lora.setFrequency(865000000)   # Adjust frequency as per your region
+lora.setTxPower(22, 1)         # 22 dBm, high power PA
+lora.setLoRaModulation(7, 125000, 5)  # SF7, BW=125kHz, CR=4/5
+lora.setPacketParams(255, 0, 1, True, False)
 
-LoRa = SX126x()
-print("Begin LoRa radio")
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Something wrong, can't begin LoRa radio")
+def nmea_to_decimal(raw, hemi, is_lat=True):
+    """Convert NMEA coordinate to decimal degrees"""
+    try:
+        if is_lat:
+            deg = int(raw[:2])
+            mins = float(raw[2:])
+        else:
+            deg = int(raw[:3])
+            mins = float(raw[3:])
+        dec = deg + mins / 60
+        if hemi in ["S", "W"]:
+            dec = -dec
+        return dec
+    except:
+        return None
 
-LoRa.setDio2RfSwitch()
-LoRa.setFrequency(865000000)   # India ISM band
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-
-# LoRa parameters
-LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, preambleLength=12,
-                   payloadLength=255, crcType=True)
-LoRa.setSyncWord(0x3444)
-
-print("\n-- LoRa GNSS Transmitter --\n")
-
-# ---------------- Transmit Loop ----------------
-counter = 0
-try:
+def get_gps_data():
+    """Read GPS data from serial"""
     while True:
-        line = gps.readline().decode("ascii", errors="ignore").strip()
+        line = gps.readline().decode("utf-8", errors="ignore").strip()
+        if line.startswith("$GPGGA"):
+            parts = line.split(",")
+            if len(parts) > 5 and parts[2] and parts[4]:
+                lat = nmea_to_decimal(parts[2], parts[3], is_lat=True)
+                lon = nmea_to_decimal(parts[4], parts[5], is_lat=False)
+                return lat, lon
+        time.sleep(0.1)
 
-        if line.startswith(("$GPGGA", "$GNGGA", "$GPRMC", "$GNRMC")):
-            coords = parse_nmea(line)
-            counter += 1
-            if coords:
-                lat, lon = coords
-                packet = f"{counter},{lat:.6f},{lon:.6f}"
-                data = packet.encode("utf-8")
+# ---------------- Main Loop ----------------
+print("LoRa GNSS Transmitter started...")
 
-                LoRa.beginPacket()
-                LoRa.write(data, len(data))
-                LoRa.endPacket(False)
-
-                print(f"[TX] {packet}")
-            else:
-                print(f"[NO_FIX] sentence={line[:20]}...")
-
-        time.sleep(1)  # send once per second
-
-except KeyboardInterrupt:
-    print("\nStopping GNSS transmitter...")
-    LoRa.end()
-    gps.close()
+while True:
+    lat, lon = get_gps_data()
+    if lat and lon:
+        message = f"{lat:.6f},{lon:.6f}"
+        print(f"Transmitting: {message}")
+        lora.beginPacket()
+        lora.print(message)
+        lora.endPacket()
+    time.sleep(1)   # send every 1 sec
