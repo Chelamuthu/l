@@ -1,154 +1,165 @@
-#!/usr/bin/env python3
-import time, serial
-import RPi.GPIO as GPIO
+import os, sys
+import time
+import serial
 from LoRaRF import SX126x
 
-# ---------------- GPIO ----------------
-GPIO.setwarnings(False)
-GPIO.cleanup()          # clear any old state
-GPIO.setmode(GPIO.BCM)
-
-# ---------------- GPS -----------------
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=0.2)
-gps.reset_input_buffer()
-
-def nmea_to_decimal(raw: str, hemi: str, is_lat=True):
-    try:
-        if not raw:
-            return None
-        if is_lat:
-            deg = int(raw[:2]); mins = float(raw[2:])
-        else:
-            deg = int(raw[:3]); mins = float(raw[3:])
-        val = deg + mins/60.0
-        if hemi in ("S", "W"):
-            val = -val
-        return val
-    except Exception:
-        return None
-
-def parse_nmea(line: str):
-    """
-    Return (lat, lon) if sentence has a valid fix; otherwise (None, None).
-    Supports GGA (fix>0) and RMC (status 'A'). Accepts GPS+GNSS variants.
-    """
-    if not line or line[0] != "$":
-        return None, None
-    parts = line.split(",")
-    tag = parts[0]
-
-    try:
-        # --- RMC ---
-        if tag in ("$GPRMC", "$GNRMC") and len(parts) > 6:
-            status = parts[2]
-            if status == "A":  # valid
-                lat = nmea_to_decimal(parts[3], parts[4], True)
-                lon = nmea_to_decimal(parts[5], parts[6], False)
-                return lat, lon
-
-        # --- GGA ---
-        if tag in ("$GPGGA", "$GNGGA") and len(parts) > 6:
-            fix_q = parts[6]
-            if fix_q and int(fix_q) > 0:
-                lat = nmea_to_decimal(parts[2], parts[3], True)
-                lon = nmea_to_decimal(parts[4], parts[5], False)
-                return lat, lon
-    except Exception:
-        pass
-
-    return None, None
-
-# --------------- LoRa -----------------
-busId, csId = 0, 0
-resetPin, busyPin, irqPin, txenPin, rxenPin = 18, 20, -1, 6, -1
-
+# ---------- LoRa setup ----------
+busId = 0; csId = 0
+resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1
 LoRa = SX126x()
+print("Begin LoRa radio")
+if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
+    raise Exception("Something wrong, can't begin LoRa radio")
 
-def init_lora():
-    if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-        raise SystemExit("LoRa init failed")
-    LoRa.setDio2RfSwitch()
-    LoRa.setFrequency(865000000)                       # set your region
-    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)          # SX1262 PA
-    LoRa.setLoRaModulation(7, 125000, 5)               # SF7, BW125, CR4/5
-    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)  # CRC on
-    LoRa.setSyncWord(0x3444)                           # must match receiver
+LoRa.setDio2RfSwitch()
+LoRa.setFrequency(865000000)                 # 865–867 MHz (India)
+LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
+LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
+LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 128, True)  # payload bigger for richer text
+LoRa.setSyncWord(0x3444)
 
-def hard_reset_lora():
-    GPIO.setup(resetPin, GPIO.OUT)
-    GPIO.output(resetPin, GPIO.LOW);  time.sleep(0.01)
-    GPIO.output(resetPin, GPIO.HIGH); time.sleep(0.05)
-    init_lora()
-    print("[RESET] LoRa hard reset")
+print("\n-- LoRa Transmitter (GNSS: multi-talker RMC/GGA) --\n")
 
-init_lora()
-print("[LoRa] ready, press Ctrl+C to stop.")
-
-# ------------- Transmit loop -----------
-counter = 0
-last_fix = (None, None)
-last_fix_time = 0.0
-period = 1.0
-next_send = time.time()
+# ---------- GNSS setup ----------
+GNSS_PORT = "/dev/ttyAMA0"       # RPi UART
+# GNSS_PORT = "COM5"             # Windows example
+GNSS_BAUD = 9600
 
 try:
-    while True:
-        # keep precise 1 Hz
-        now = time.time()
-        if now < next_send:
-            time.sleep(next_send - now)
-        now = next_send
-        next_send += period
+    gps_serial = serial.Serial(GNSS_PORT, GNSS_BAUD, timeout=1)
+    print(f"Opened GNSS on {GNSS_PORT}")
+except Exception as e:
+    print("Error opening GNSS:", e)
+    gps_serial = None
 
-        # read a few NMEA lines quickly to catch the latest fix
-        lat, lon = None, None
-        for _ in range(15):  # ~ a few ms total (timeout=0.2 on port)
-            line = gps.readline().decode("ascii", "ignore").strip()
-            if line:
-                lat, lon = parse_nmea(line)
+# ---------- Helpers ----------
+def convert_lat_lon(lat_str, ns, lon_str, ew):
+    """NMEA ddmm.mmmm / dddmm.mmmm -> decimal degrees. Returns (None, None) if invalid."""
+    if not lat_str or not lon_str or ns not in ("N","S") or ew not in ("E","W"):
+        return None, None
+    try:
+        # latitude: 2 deg digits
+        lat_deg = float(lat_str[:2])
+        lat_min = float(lat_str[2:])
+        lat = lat_deg + lat_min/60.0
+        if ns == "S": lat = -lat
+        # longitude: 3 deg digits
+        lon_deg = float(lon_str[:3])
+        lon_min = float(lon_str[3:])
+        lon = lon_deg + lon_min/60.0
+        if ew == "W": lon = -lon
+        return lat, lon
+    except:
+        return None, None
+
+def format_utc(hhmmss):
+    """hhmmss(.sss) -> hh:mm:ss UTC"""
+    if not hhmmss or len(hhmmss) < 6: return "N/A"
+    try:
+        hh, mm, ss = hhmmss[0:2], hhmmss[2:4], hhmmss[4:6]
+        return f"{hh}:{mm}:{ss} UTC"
+    except:
+        return "N/A"
+
+def is_rmc(sentence):
+    # Any talker: $GNRMC, $GPRMC, $GARMC, $BDRMC, ...
+    return sentence.startswith("$") and sentence[3:6] == "RMC"
+
+def is_gga(sentence):
+    # Any talker: $GNGGA, $GPGGA, $GAGGA, $BDGGA, ...
+    return sentence.startswith("$") and sentence[3:6] == "GGA"
+
+counter = 0
+last_fix = None   # keep last valid fix to show movement smoothly (optional)
+
+while True:
+    latitude = longitude = speed_kmh = course_deg = None
+    utc_time = None
+    sats_used = hdop = altitude_m = None
+
+    try:
+        line = gps_serial.readline().decode("utf-8", errors="ignore").strip() if gps_serial else ""
+        if line.startswith("$"):
+            print("NMEA:", line)  # keep for debugging; comment out if too chatty
+
+        # -------- RMC: time, status, lat, lon, speed(knots), course, date --------
+        if is_rmc(line):
+            parts = line.split(",")
+            # Expected fields per RMC
+            #  1: UTC time, 2: Status (A/V), 3-6: lat,NS,lon,EW, 7: speed(knots), 8: course, 9: date
+            if len(parts) >= 10 and parts[2] == "A":   # 'A' = valid fix
+                utc_time = format_utc(parts[1])
+                lat, lon = convert_lat_lon(parts[3], parts[4], parts[5], parts[6])
                 if lat is not None and lon is not None:
-                    last_fix = (lat, lon)
-                    last_fix_time = time.time()
-                    break
+                    latitude, longitude = lat, lon
+                # speed
+                try:
+                    if parts[7] != "": speed_kmh = float(parts[7]) * 1.852
+                except: pass
+                # course over ground
+                try:
+                    if parts[8] != "": course_deg = float(parts[8])
+                except: pass
 
-        # build payload
-        counter += 1
-        ts = time.strftime("%H:%M:%S", time.localtime(now))
-        if last_fix[0] is not None and (now - last_fix_time) < 5.0:
-            msg = f"{counter},{ts},{last_fix[0]:.6f},{last_fix[1]:.6f}"
-        else:
-            msg = f"{counter},{ts},NO_FIX"
+        # -------- GGA: time, lat/lon, fix quality, sats, HDOP, altitude --------
+        elif is_gga(line):
+            parts = line.split(",")
+            # 1: time, 2-5: lat,NS,lon,EW, 6: fix quality (0=no fix), 7:sats, 8:HDOP, 9:alt(m)
+            if len(parts) >= 10 and parts[6] not in ("", "0"):
+                utc_time = format_utc(parts[1]) if not utc_time else utc_time
+                lat, lon = convert_lat_lon(parts[2], parts[3], parts[4], parts[5])
+                if lat is not None and lon is not None:
+                    latitude, longitude = lat, lon
+                try:
+                    if parts[7] != "": sats_used = int(parts[7])
+                except: pass
+                try:
+                    if parts[8] != "": hdop = float(parts[8])
+                except: pass
+                try:
+                    if parts[9] != "": altitude_m = float(parts[9])
+                except: pass
 
-        data = msg.encode("utf-8")
+    except Exception as e:
+        print("GPS parse error:", e)
 
-        # send
-        try:
-            LoRa.beginPacket()
-            LoRa.write(data, len(data))
-            LoRa.endPacket(False)  # non-blocking
+    # If no fresh fix this loop, optionally fall back to last known fix
+    if latitude is None or longitude is None:
+        if last_fix:
+            latitude, longitude, speed_kmh, course_deg, utc_time, sats_used, hdop, altitude_m = last_fix
+    else:
+        last_fix = (latitude, longitude, speed_kmh, course_deg, utc_time, sats_used, hdop, altitude_m)
 
-            # wait briefly for TX-done; fallback to quick reset if stuck
-            # For a short payload at SF7/BW125 this should finish well < 200 ms.
-            if not LoRa.wait(250):  # milliseconds
-                print("[WARN] TX timeout → hard reset")
-                hard_reset_lora()
-                continue
+    # -------- Build & send LoRa message --------
+    if latitude is not None and longitude is not None:
+        spd_txt = f"{speed_kmh:.2f}km/h" if isinstance(speed_kmh, (int,float)) else "N/A"
+        crs_txt = f"{course_deg:.1f}°"    if isinstance(course_deg, (int,float)) else "N/A"
+        time_txt = utc_time if utc_time else "N/A"
+        sats_txt = str(sats_used) if sats_used is not None else "N/A"
+        hdop_txt = f"{hdop:.1f}" if isinstance(hdop, (int,float)) else "N/A"
+        alt_txt  = f"{altitude_m:.1f}m" if isinstance(altitude_m, (int,float)) else "N/A"
 
-            # metrics (best-effort)
-            try:
-                tx_time = LoRa.transmitTime()
-                rate = LoRa.dataRate()
-                print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.1f} B/s")
-            except Exception:
-                print(f"[SENT] {msg}")
+        message = (
+            f"GPS:{latitude:.5f},{longitude:.5f} "
+            f"Spd:{spd_txt} Crs:{crs_txt} "
+            f"Time:{time_txt} Sats:{sats_txt} HDOP:{hdop_txt} Alt:{alt_txt} "
+            f"Cnt:{counter}"
+        )
+    else:
+        message = f"No GPS Fix Cnt:{counter}"
 
-        except Exception as e:
-            print("[ERROR] LoRa send failed:", e)
-            hard_reset_lora()
-            continue
+    try:
+        payload = [ord(c) for c in message]
+        LoRa.beginPacket()
+        LoRa.write(payload, len(payload))
+        LoRa.endPacket()
+        LoRa.wait()
 
-except KeyboardInterrupt:
-    print("Stopping …")
-    LoRa.end()
-    gps.close()
-    GPIO.cleanup()
+        print(f"Sent: {message}")
+        print("Transmit time: {0:0.2f} ms | Data rate: {1:0.2f} byte/s"
+              .format(LoRa.transmitTime(), LoRa.dataRate()))
+    except Exception as e:
+        print("LoRa send error:", e)
+
+    time.sleep(1.0)   # faster updates if GNSS is streaming at 1 Hz
+    counter = (counter + 1) % 256
