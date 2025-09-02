@@ -1,84 +1,56 @@
-import time, serial
+#!/usr/bin/env python3
+import serial
+import time
+import RPi.GPIO as GPIO
 from LoRaRF import SX126x
+
+# ---------------- GPIO Setup ----------------
+GPIO.setwarnings(False)
+GPIO.cleanup()
+GPIO.setmode(GPIO.BCM)
 
 # ---------------- GPS Setup ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
-def parse_nmea(sentence):
-    """Extract latitude & longitude from NMEA sentence"""
+def nmea_to_decimal(raw, hemi, is_lat=True):
+    """Convert NMEA coordinate format to decimal degrees"""
     try:
-        parts = sentence.split(",")
-        if parts[0] in ["$GPGGA", "$GPRMC"]:   # Accept both types
-            lat_raw = parts[2]
-            lat_hemi = parts[3]
-            lon_raw = parts[4]
-            lon_hemi = parts[5]
-
-            if lat_raw and lon_raw:
-                # Convert NMEA to decimal degrees
-                lat = float(lat_raw[:2]) + float(lat_raw[2:]) / 60.0
-                lon = float(lon_raw[:3]) + float(lon_raw[3:]) / 60.0
-
-                if lat_hemi == "S":
-                    lat = -lat
-                if lon_hemi == "W":
-                    lon = -lon
-                return lat, lon
+        if is_lat:  # Latitude DDMM.MMMM
+            deg = int(raw[0:2])
+            minutes = float(raw[2:])
+        else:  # Longitude DDDMM.MMMM
+            deg = int(raw[0:3])
+            minutes = float(raw[3:])
+        decimal = deg + (minutes / 60.0)
+        if hemi in ["S", "W"]:
+            decimal = -decimal
+        return round(decimal, 6)
     except:
         return None
-    return None
+
+def get_gps():
+    """Fetch latitude and longitude from NMEA GPGGA/GPRMC sentences"""
+    while True:
+        line = gps.readline().decode("ascii", errors="ignore").strip()
+        if line.startswith("$GPGGA") or line.startswith("$GPRMC"):
+            parts = line.split(",")
+            if len(parts) > 5 and parts[2] and parts[4]:
+                lat = nmea_to_decimal(parts[2], parts[3], True)
+                lon = nmea_to_decimal(parts[4], parts[5], False)
+                if lat and lon:
+                    return lat, lon
 
 # ---------------- LoRa Setup ----------------
-busId = 0; csId = 0
-resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1
+lora = SX126x()
+lora.begin(freq=865.2, bw=125.0, sf=7, cr=5, syncWord=0x12, power=14, currentLimit=60.0, 
+           preambleLength=8, implicit=False, implicitLen=0xFF, crc=True, invertIQ=False)
+print("LoRa initialized for GNSS telemetry...")
 
-LoRa = SX126x()
-print("Begin LoRa radio")
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Something wrong, can't begin LoRa radio")
-
-LoRa.setDio2RfSwitch()
-LoRa.setFrequency(865000000)   # India ISM band
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-
-# LoRa parameters
-sf = 7; bw = 125000; cr = 5
-LoRa.setLoRaModulation(sf, bw, cr)
-
-headerType = LoRa.HEADER_EXPLICIT
-preambleLength = 12
-payloadLength = 255
-crcType = True
-LoRa.setLoRaPacket(headerType, preambleLength, payloadLength, crcType)
-LoRa.setSyncWord(0x3444)
-
-print("\n-- LoRa GNSS Transmitter --\n")
-
-# ---------------- Transmit Loop ----------------
-try:
-    while True:
-        line = gps.readline().decode("utf-8", errors="ignore").strip()
-
-        if line.startswith("$GPGGA") or line.startswith("$GPRMC"):
-            coords = parse_nmea(line)
-            if coords:
-                lat, lon = coords
-
-                # Format as plain text
-                packet = f"{lat:.6f},{lon:.6f}"
-                packet_bytes = packet.encode("utf-8")  # 👈 send as string, not ord()
-
-                # Send LoRa packet
-                LoRa.beginPacket()
-                LoRa.write(packet_bytes, len(packet_bytes))
-                LoRa.endPacket(False)  # non-blocking send
-
-                # Print clean output
-                print(f"Latitude: {lat:.6f}, Longitude: {lon:.6f}")
-
-                time.sleep(1)  # GNSS update rate
-
-except KeyboardInterrupt:
-    print("\nStopping GNSS transmitter...")
-    LoRa.end()
-    gps.close()
+# ---------------- Main Loop ----------------
+while True:
+    lat, lon = get_gps()
+    msg = f"LAT:{lat}, LON:{lon}"
+    print("Sending:", msg)
+    
+    lora.send(msg.encode("utf-8"))
+    time.sleep(1)  # 1 second delay
