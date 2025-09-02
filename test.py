@@ -1,21 +1,21 @@
-import os, sys, time, serial
+import time, serial
 from LoRaRF import SX126x
 
 # ---------------- GPS Setup ----------------
 gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
 def parse_nmea(sentence):
-    """Extract latitude & longitude from NMEA GPGGA sentence"""
+    """Extract latitude & longitude from NMEA sentence"""
     try:
         parts = sentence.split(",")
         if parts[0] in ["$GPGGA", "$GPRMC"]:   # Accept both types
-            # Latitude
             lat_raw = parts[2]
             lat_hemi = parts[3]
             lon_raw = parts[4]
             lon_hemi = parts[5]
 
             if lat_raw and lon_raw:
+                # Convert to decimal degrees
                 lat = float(lat_raw[:2]) + float(lat_raw[2:]) / 60.0
                 lon = float(lon_raw[:3]) + float(lon_raw[3:]) / 60.0
 
@@ -24,7 +24,8 @@ def parse_nmea(sentence):
                 if lon_hemi == "W":
                     lon = -lon
                 return lat, lon
-    except Exception:
+    except Exception as e:
+        print("Parse error:", e)
         return None
     return None
 
@@ -38,10 +39,10 @@ if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
     raise Exception("Something wrong, can't begin LoRa radio")
 
 LoRa.setDio2RfSwitch()
-LoRa.setFrequency(865000000)   # Set frequency to 865 MHz (India ISM band)
+LoRa.setFrequency(865000000)   # India ISM band
 LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
 
-# LoRa parameters
+# LoRa parameters (fast but reliable)
 sf = 7
 bw = 125000
 cr = 5
@@ -60,24 +61,26 @@ print("\n-- LoRa GNSS Transmitter --\n")
 try:
     while True:
         line = gps.readline().decode("utf-8", errors="ignore").strip()
+        if line:
+            print("RAW GPS:", line)   # Debugging output
 
         if line.startswith("$GPGGA") or line.startswith("$GPRMC"):
             coords = parse_nmea(line)
             if coords:
                 lat, lon = coords
-                packet = f"LAT:{lat:.6f}, LON:{lon:.6f}"
+                packet = f"LAT:{lat:.6f},LON:{lon:.6f}"
                 packet_bytes = [ord(c) for c in packet]
 
-                # Send packet
+                # Send LoRa packet (non-blocking)
                 LoRa.beginPacket()
                 LoRa.write(packet_bytes, len(packet_bytes))
-                LoRa.endPacket()
+                LoRa.endPacket(False)
 
                 print(f"Sent -> {packet}")
-                print("Transmit time: {:.2f} ms | Data rate: {:.2f} byte/s"
+                print("TX time: {:.2f} ms | Rate: {:.2f} B/s"
                       .format(LoRa.transmitTime(), LoRa.dataRate()))
 
-                time.sleep(1)  # 1 second between GNSS updates
+                time.sleep(1)  # 1 update per second (adjust if needed)
 
 except KeyboardInterrupt:
     print("\nStopping GNSS transmitter...")
