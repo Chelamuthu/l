@@ -23,28 +23,34 @@ def nmea_to_decimal(raw, hemi, is_lat=True):
         return None
 
 def read_gps():
-    """Read NMEA GPS data and return (lat, lon, speed, time)"""
+    """
+    Read one line of NMEA GPS data.
+    Return (lat, lon, speed, time, fix_status).
+    fix_status = True if GPS fix, False if not.
+    """
     try:
         line = gps.readline().decode("ascii", errors="ignore").strip()
-        if line.startswith("$GPRMC"):  # Recommended minimum GPS data
+        if line.startswith("$GPRMC"):
             parts = line.split(",")
-            if len(parts) > 7 and parts[2] == "A":  # A = Active, V = Void
-                raw_lat, hemi_lat = parts[3], parts[4]
-                raw_lon, hemi_lon = parts[5], parts[6]
-                speed_knots = float(parts[7]) if parts[7] else 0.0
-                raw_time = parts[1]
+            if len(parts) > 7:
+                if parts[2] == "A":  # GPS fix
+                    raw_lat, hemi_lat = parts[3], parts[4]
+                    raw_lon, hemi_lon = parts[5], parts[6]
+                    speed_knots = float(parts[7]) if parts[7] else 0.0
+                    raw_time = parts[1]
 
-                lat = nmea_to_decimal(raw_lat, hemi_lat, True)
-                lon = nmea_to_decimal(raw_lon, hemi_lon, False)
-                speed_kmh = speed_knots * 1.852  # Convert knots → km/h
+                    lat = nmea_to_decimal(raw_lat, hemi_lat, True)
+                    lon = nmea_to_decimal(raw_lon, hemi_lon, False)
+                    speed_kmh = speed_knots * 1.852  # knots → km/h
+                    utc_time = f"{raw_time[0:2]}:{raw_time[2:4]}:{raw_time[4:6]}"
 
-                # Format time as HH:MM:SS
-                utc_time = f"{raw_time[0:2]}:{raw_time[2:4]}:{raw_time[4:6]}"
-
-                return lat, lon, speed_kmh, utc_time
+                    return lat, lon, speed_kmh, utc_time, True
+                else:
+                    # No GPS fix yet
+                    return None, None, None, None, False
     except Exception:
         pass
-    return None, None, None, None
+    return None, None, None, None, False
 
 # ----------------- LoRa Setup -----------------
 busId = 0; csId = 0
@@ -72,14 +78,15 @@ print("\n-- LoRa GNSS Transmitter --\n")
 # ----------------- Main Loop -----------------
 counter = 0
 while True:
-    lat, lon, speed, utc_time = read_gps()
+    lat, lon, speed, utc_time, fix = read_gps()
 
-    if lat is not None and lon is not None:
+    if fix:
+        # GPS fix available
         message = f"{lat:.6f},{lon:.6f},{speed:.2f}km/h,{utc_time}"
     else:
-        print("No GPS fix, skipping this cycle...")
-        time.sleep(1)
-        continue
+        # No GPS fix → still send status with system time
+        system_time = datetime.utcnow().strftime("%H:%M:%S")
+        message = f"NO_FIX,{counter},{system_time}"
 
     # Convert message to bytes
     message_bytes = [ord(c) for c in message]
