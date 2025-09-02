@@ -1,79 +1,61 @@
-#!/usr/bin/env python3
-import time, serial
-import RPi.GPIO as GPIO
+import os, sys, time
 from LoRaRF import SX126x
 
-# ---------------- GPIO FIX ----------------
-GPIO.setwarnings(False)
-GPIO.cleanup()
-GPIO.setmode(GPIO.BCM)
-
-# ---------------- GNSS SETUP ----------------
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
-
-def nmea_to_decimal(raw, hemi, is_lat=True):
-    """Convert NMEA lat/lon to decimal degrees"""
-    try:
-        if not raw or raw == "":
-            return None
-        deg_len = 2 if is_lat else 3
-        deg = float(raw[:deg_len])
-        minutes = float(raw[deg_len:])
-        decimal = deg + minutes / 60
-        if hemi in ["S", "W"]:
-            decimal *= -1
-        return decimal
-    except:
-        return None
-
-def get_gps_data():
-    """Read GPS NMEA data and return lat, lon, fix status"""
-    try:
-        line = gps.readline().decode(errors="ignore").strip()
-        if line.startswith("$GNGGA"):  # GPS fix data
-            parts = line.split(",")
-            if len(parts) < 7:
-                return None, None, False
-            lat = nmea_to_decimal(parts[2], parts[3], is_lat=True)
-            lon = nmea_to_decimal(parts[4], parts[5], is_lat=False)
-            fix = parts[6] != "0"  # fix quality (0 = no fix)
-            return lat, lon, fix
-    except Exception as e:
-        print("GPS read error:", e)
-    return None, None, False
-
-# ---------------- LoRa SETUP ----------------
-busId = 0; csId = 0
-resetPin = 18; busyPin = 20; irqPin = -1
-txenPin = 6; rxenPin = -1
+# ---------------- Setup ----------------
+busId = 0; csId = 0 
+resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1 
 
 LoRa = SX126x()
-print("Begin LoRa radio...")
+print("Begin LoRa radio")
 if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    print("LoRa init failed")
-    exit(1)
+    raise Exception("Something wrong, can't begin LoRa radio")
 
-LoRa.setFrequency(868000000)   # Adjust freq for your region (e.g., 868 MHz / 915 MHz / 433 MHz)
-LoRa.setTxPower(22, SX126x.TX_POWER_SX1262)
-LoRa.setSpreadingFactor(7)
-LoRa.setBandwidth(125000)
-LoRa.setCodingRate(5)
-LoRa.setSyncWord(0x1424)
+LoRa.setDio2RfSwitch()
+LoRa.setFrequency(865000000)
+LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
 
-print("LoRa init success")
+# LoRa parameters
+sf = 7
+bw = 125000
+cr = 5
+LoRa.setLoRaModulation(sf, bw, cr)
 
-# ---------------- MAIN LOOP ----------------
-while True:
-    lat, lon, fix = get_gps_data()
+# Payload length set to max for flexibility
+headerType = LoRa.HEADER_EXPLICIT
+preambleLength = 12
+payloadLength = 255    # max length (let us decide per packet)
+crcType = True
+LoRa.setLoRaPacket(headerType, preambleLength, payloadLength, crcType)
 
-    if fix and lat and lon:
-        msg = f"LAT:{lat:.6f}, LON:{lon:.6f}"
-    else:
-        msg = "NO FIX"
+LoRa.setSyncWord(0x3444)
 
-    print("TX:", msg)
-    LoRa.beginPacket()
-    LoRa.print(msg)
-    LoRa.endPacket()
+print("\n-- LoRa Transmitter (Continuous High Speed) --\n")
 
-    time.sleep(2)
+# ---------------- Transmission Loop ----------------
+message = "HeLoRa World!"
+counter = 0
+
+try:
+    while True:
+        # Build message
+        packet = f"{message} {counter}"
+        packet_bytes = [ord(c) for c in packet]
+
+        # Send packet
+        LoRa.beginPacket()
+        LoRa.write(packet_bytes, len(packet_bytes))
+        LoRa.endPacket()
+
+        # Print transmit info
+        print(f"Sent: {packet}")
+        print("Transmit time: {:.2f} ms | Data rate: {:.2f} byte/s"
+              .format(LoRa.transmitTime(), LoRa.dataRate()))
+
+        counter = (counter + 1) % 256
+
+        # Small delay (adjust for speed vs reliability)
+        time.sleep(0.2)   # 200 ms between packets
+
+except KeyboardInterrupt:
+    print("\nStopping LoRa transmitter...")
+    LoRa.end()
