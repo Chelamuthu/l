@@ -1,82 +1,95 @@
 #!/usr/bin/env python3
-import time
-import serial
+import time, serial
 from LoRaRF import SX126x
 import RPi.GPIO as GPIO
+from datetime import datetime
 
 # ---------------- GPIO SETUP ----------------
 GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BCM)
 
-# ---------------- GNSS SETUP ----------------
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=0.5)
+# ---------------- GPS SETUP ----------------
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
 
-# ---------------- LoRa SETUP ----------------
-lora = SX126x()
-lora.begin()
-lora.setFrequency(868000000)   # set frequency (adjust for your region)
-lora.setTxPower(22, lora.TX_POWER_SX1262)
-lora.setLoRaModulation(7, 5, 125000, lora.LDRO_AUTO)
-
-# Correct buffer-safe packet params
-lora.setPacketParams(
-    12,                        # preambleLength
-    lora.HEADER_EXPLICIT,      # headerType
-    255,                       # payloadLength (max)
-    lora.CRC_ON,               # crcType
-    lora.IQ_STANDARD           # invertIQ
-)
-
-# ---------------- UTILITIES ----------------
-def nmea_to_decimal(raw, hemi, is_lat=True):
-    """Convert NMEA raw coordinate to decimal degrees."""
+def parse_nmea_latlon(nmea_sentence):
+    """Extract latitude, longitude, speed from NMEA GPRMC"""
     try:
-        deg_len = 2 if is_lat else 3
-        deg = float(raw[:deg_len])
-        minutes = float(raw[deg_len:])
-        decimal = deg + (minutes / 60.0)
-        if hemi in ['S', 'W']:
-            decimal *= -1
-        return decimal
+        parts = nmea_sentence.split(",")
+        if parts[0].endswith("RMC") and parts[2] == "A":  # Valid fix
+            # Latitude
+            raw_lat = parts[3]
+            lat_dir = parts[4]
+            lat = float(raw_lat[:2]) + float(raw_lat[2:]) / 60
+            if lat_dir == "S":
+                lat = -lat
+
+            # Longitude
+            raw_lon = parts[5]
+            lon_dir = parts[6]
+            lon = float(raw_lon[:3]) + float(raw_lon[3:]) / 60
+            if lon_dir == "W":
+                lon = -lon
+
+            # Speed (knots → km/h)
+            speed_knots = float(parts[7])
+            speed_kmh = speed_knots * 1.852
+
+            return lat, lon, speed_kmh
     except:
         return None
+    return None
 
-def read_gnss():
-    """Read one valid GNSS line and extract lat, lon, speed."""
-    line = gps.readline().decode("ascii", errors="ignore").strip()
-    if line.startswith("$GPRMC"):
-        parts = line.split(",")
-        if len(parts) > 7 and parts[2] == "A":  # Data valid
-            lat = nmea_to_decimal(parts[3], parts[4], True)
-            lon = nmea_to_decimal(parts[5], parts[6], False)
-            speed = float(parts[7]) * 1.852  # knots → km/h
-            return lat, lon, speed
-    return None, None, None
+# ---------------- LORA SETUP ----------------
+lora = SX126x()
+lora.begin()
+
+# Frequency 868 MHz (set as per your dongle)
+lora.setFrequency(868000000)
+
+# Modulation Params
+lora.setModulationParams(
+    lora.SF7,          # spreading factor
+    lora.BW125,        # bandwidth 125kHz
+    lora.CR_4_5,       # coding rate 4/5
+    lora.LDRO_AUTO     # auto low data rate optimize
+)
+
+# Packet Params
+lora.setPacketParams(
+    preambleLength=12,
+    headerType=lora.HEADER_EXPLICIT,
+    payloadLength=255,
+    crcType=lora.CRC_ON,
+    invertIQ=lora.IQ_STANDARD
+)
 
 # ---------------- MAIN LOOP ----------------
 counter = 0
-print("Starting GNSS → LoRa transmission...")
+print("LoRa GNSS transmitter started...")
 
 while True:
-    lat, lon, speed = read_gnss()
-    if lat and lon:
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        message = f"Latitude={lat:.6f}, Longitude={lon:.6f}, Speed={speed:.2f}km/h, Counter={counter}, Time={now}"
+    line = gps.readline().decode("utf-8", errors="ignore").strip()
+    gnss_data = parse_nmea_latlon(line)
 
-        # --- BUFFER HANDLING ---
-        try:
-            lora.send(message.encode("utf-8"))
-        except Exception as e:
-            print("⚠ Buffer overflow, clearing FIFO and retrying...")
-            lora.begin()  # re-init clears buffer
-            lora.setFrequency(868000000)
-            lora.setTxPower(22, lora.TX_POWER_SX1262)
-            lora.setLoRaModulation(7, 5, 125000, lora.LDRO_AUTO)
-            lora.setPacketParams(12, lora.HEADER_EXPLICIT, 255, lora.CRC_ON, lora.IQ_STANDARD)
-            lora.send(message.encode("utf-8"))
+    if gnss_data:
+        lat, lon, speed = gnss_data
+        now = datetime.now().strftime("%H:%M:%S")
 
-        print("TX ->", message)
+        message = (
+            f"Latitude: {lat:.6f}, Longitude: {lon:.6f}, "
+            f"Speed: {speed:.2f} km/h, Counter: {counter}, Time: {now}"
+        )
 
-        counter = (counter + 1) % 256  # roll over at 255
+        # Clear FIFO if needed
+        lora.flushBuffer()
 
-    time.sleep(1)  # small delay to avoid flooding
+        # Transmit
+        lora.send(message.encode("utf-8"))
+
+        # Print same as transmitted
+        print(message)
+
+        # Roll counter (0–255)
+        counter = (counter + 1) % 256
+
+        time.sleep(1)  # adjust interval if needed
