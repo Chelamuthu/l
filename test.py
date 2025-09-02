@@ -1,113 +1,178 @@
-import os, sys, time, serial
-from datetime import datetime
-
-# ----------------- Import LoRa Library -----------------
-currentdir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(os.path.dirname(os.path.dirname(currentdir)))
+#!/usr/bin/env python3
+import time, serial
+import RPi.GPIO as GPIO
 from LoRaRF import SX126x
 
-# ----------------- GPS Setup -----------------
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
+# ---------------- GPIO ----------------
+GPIO.setwarnings(False)
+GPIO.cleanup()
+GPIO.setmode(GPIO.BCM)
+
+# ---------------- GPS -----------------
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=0.1)
+gps.reset_input_buffer()
 
 def nmea_to_decimal(raw, hemi, is_lat=True):
-    """Convert NMEA degree format to decimal degrees"""
     try:
+        if not raw:
+            return None
         deg_len = 2 if is_lat else 3
-        degrees = int(raw[:deg_len])
+        deg = float(raw[:deg_len])
         minutes = float(raw[deg_len:])
-        decimal = degrees + (minutes / 60.0)
-        if hemi in ['S', 'W']:
-            decimal = -decimal
-        return decimal
+        val = deg + (minutes / 60.0)
+        if hemi in ("S", "W"):
+            val = -val
+        return val
     except Exception:
         return None
 
-def read_gps():
-    """
-    Read one line of NMEA GPS data.
-    Return (lat, lon, speed, time, fix_status).
-    fix_status = True if GPS fix, False if not.
-    """
+def parse_nmea(line):
+    if not line or "," not in line:
+        return None, None, None
+    parts = line.split(",")
     try:
-        line = gps.readline().decode("ascii", errors="ignore").strip()
-        if line.startswith("$GPRMC"):
-            parts = line.split(",")
-            if len(parts) > 7:
-                if parts[2] == "A":  # GPS fix
-                    raw_lat, hemi_lat = parts[3], parts[4]
-                    raw_lon, hemi_lon = parts[5], parts[6]
-                    speed_knots = float(parts[7]) if parts[7] else 0.0
-                    raw_time = parts[1]
-
-                    lat = nmea_to_decimal(raw_lat, hemi_lat, True)
-                    lon = nmea_to_decimal(raw_lon, hemi_lon, False)
-                    speed_kmh = speed_knots * 1.852  # knots → km/h
-                    utc_time = f"{raw_time[0:2]}:{raw_time[2:4]}:{raw_time[4:6]}"
-
-                    return lat, lon, speed_kmh, utc_time, True
-                else:
-                    # No GPS fix yet
-                    return None, None, None, None, False
+        # RMC gives position + speed
+        if line.startswith("$GPRMC") or line.startswith("$GNRMC"):
+            if len(parts) > 7 and parts[2] == "A":
+                lat = nmea_to_decimal(parts[3], parts[4], True)
+                lon = nmea_to_decimal(parts[5], parts[6], False)
+                sp_kn = float(parts[7]) if parts[7] else 0.0
+                return lat, lon, sp_kn * 1.852
+        # GGA gives position only
+        if (line.startswith("$GPGGA") or line.startswith("$GNGGA")) and len(parts) > 6:
+            fix = int(parts[6]) if parts[6].isdigit() else 0
+            if fix > 0:
+                lat = nmea_to_decimal(parts[2], parts[3], True)
+                lon = nmea_to_decimal(parts[4], parts[5], False)
+                return lat, lon, None
     except Exception:
         pass
-    return None, None, None, None, False
+    return None, None, None
 
-# ----------------- LoRa Setup -----------------
-busId = 0; csId = 0
-resetPin = 18; busyPin = 20; irqPin = -1; txenPin = 6; rxenPin = -1
+def get_gps_sample(window_ms=300):
+    """Read as many NMEA lines as arrive within window_ms ms and return freshest valid fix."""
+    deadline = time.time() + (window_ms / 1000.0)
+    best = (None, None, None)
+    while time.time() < deadline:
+        try:
+            line = gps.readline().decode("ascii", "ignore").strip()
+        except Exception:
+            line = ""
+        if line:
+            lat, lon, spd = parse_nmea(line)
+            if lat is not None and lon is not None:
+                best = (lat, lon, spd if spd is not None else best[2])
+        if gps.in_waiting > 2000:  # avoid backlog
+            gps.reset_input_buffer()
+        time.sleep(0.005)
+    return best
+
+# ---------------- LORA -----------------
+busId = 0
+csId = 0
+resetPin = 18
+busyPin = 20
+irqPin = -1
+txenPin = 6
+rxenPin = -1
+
 LoRa = SX126x()
 
-print("Begin LoRa radio")
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Something wrong, can't begin LoRa radio")
+def init_lora():
+    if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
+        raise SystemExit("LoRa init failed")
+    LoRa.setDio2RfSwitch()
+    LoRa.setFrequency(865000000)           # adjust to region
+    LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
+    LoRa.setLoRaModulation(7, 125000, 5)   # SF7, BW125, CR4/5
+    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 0, True)
+    LoRa.setSyncWord(0x3444)
 
-LoRa.setDio2RfSwitch()
-print("Set frequency to 865 MHz")
-LoRa.setFrequency(865000000)
-print("Set TX power to +22 dBm")
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
-print("Set modulation parameters")
-LoRa.setLoRaModulation(7, 125000, 5)
-print("Set packet parameters (initial)")
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, 64, True)
-print("Set sync word")
-LoRa.setSyncWord(0x3444)
+def soft_reset_lora():
+    try:
+        LoRa.reset()
+    except Exception:
+        pass
+    init_lora()
+    print("[RESET] Soft reset")
 
-print("\n-- LoRa GNSS Transmitter --\n")
+def hard_reset_lora():
+    GPIO.setup(resetPin, GPIO.OUT)
+    GPIO.output(resetPin, GPIO.LOW)
+    time.sleep(0.01)
+    GPIO.output(resetPin, GPIO.HIGH)
+    time.sleep(0.05)
+    init_lora()
+    print("[RESET] Hard reset")
 
-# ----------------- Main Loop -----------------
+init_lora()
+print("[LoRa] ready, press Ctrl+C to stop.")
+
+# ---------------- MAIN LOOP ----------------
+period = 1.0
+next_tick = time.time()
 counter = 0
-while True:
-    lat, lon, speed, utc_time, fix = read_gps()
+fail_count = 0
 
-    if fix:
-        # GPS fix available
-        message = f"{lat:.6f},{lon:.6f},{speed:.2f}km/h,{utc_time}"
-    else:
-        # No GPS fix → still send status with system time
-        system_time = datetime.utcnow().strftime("%H:%M:%S")
-        message = f"NO_FIX,{counter},{system_time}"
+try:
+    while True:
+        # keep exact 1 Hz
+        now = time.time()
+        if now < next_tick:
+            time.sleep(next_tick - now)
+        tick_time = next_tick
+        next_tick += period
 
-    # Convert message to bytes
-    message_bytes = [ord(c) for c in message]
+        # ---- GPS ----
+        lat, lon, speed = get_gps_sample(window_ms=300)
+        timestamp = time.strftime("%H:%M:%S", time.localtime(tick_time))
 
-    # Update payload length dynamically
-    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, len(message_bytes) + 1, True)
+        # ---- Build message ----
+        counter += 1
+        if lat is not None and lon is not None:
+            msg = f"{counter},{timestamp},{lat:.6f},{lon:.6f},{(speed or 0):.1f}km/h"
+        else:
+            msg = f"{counter},{timestamp},NO_FIX"
 
-    # Transmit
-    LoRa.beginPacket()
-    LoRa.write(message_bytes, len(message_bytes))
-    LoRa.write([counter], 1)   # add counter at end
-    LoRa.endPacket()
+        data = list(msg.encode())
 
-    # Debug print
-    print(f"Sent: {message} | Count: {counter}")
+        # ---- Send LoRa ----
+        try:
+            LoRa.beginPacket()
+            LoRa.write(data, len(data))
+            LoRa.endPacket(False)  # non-blocking
 
-    # Wait until transmit complete
-    LoRa.wait()
-    print("Transmit time: {0:0.2f} ms | Data rate: {1:0.2f} byte/s"
-          .format(LoRa.transmitTime(), LoRa.dataRate()))
+            # watchdog: expected airtime + margin
+            est_ms = int(LoRa.transmitTime() * 1000) + 50
+            if est_ms < 40:
+                est_ms = 40
 
-    # Send every 1 second
-    time.sleep(1)
-    counter = (counter + 1) % 256
+            if not LoRa.wait(est_ms):
+                fail_count += 1
+                print(f"[WARN] TX timeout (> {est_ms} ms)")
+                if fail_count >= 3:
+                    hard_reset_lora()
+                    fail_count = 0
+                else:
+                    soft_reset_lora()
+                continue
+            else:
+                fail_count = 0
+
+            try:
+                tx_time = LoRa.transmitTime()
+                rate = LoRa.dataRate()
+                print(f"[SENT] {msg} | {len(data)}B | TX {tx_time:.1f} ms | {rate:.2f} B/s")
+            except Exception:
+                print(f"[SENT] {msg} | {len(data)}B")
+
+        except Exception as e:
+            print("[ERROR] TX failed:", e)
+            hard_reset_lora()
+            continue
+
+except KeyboardInterrupt:
+    print("Stopped by user")
+    LoRa.end()
+    gps.close()
+    GPIO.cleanup()
