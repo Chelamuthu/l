@@ -1,62 +1,62 @@
 #!/usr/bin/env python3
-import serial
 import time
-from LoRaRF import SX126x
+import serial
 import RPi.GPIO as GPIO
+from LoRaRF import SX126x
 
-# ---------------- GPIO Setup ----------------
+# ---------------- GPIO SETUP ----------------
 GPIO.setwarnings(False)
-GPIO.setmode(GPIO.BCM)
 GPIO.cleanup()
+GPIO.setmode(GPIO.BCM)
 
-# ---------------- GPS Setup ----------------
-gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=1)
+# ---------------- GPS SETUP ----------------
+gps = serial.Serial("/dev/ttyAMA0", baudrate=9600, timeout=0.5)
 
-# ---------------- LoRa Setup ----------------
+# ---------------- LoRa SETUP ----------------
 lora = SX126x()
-lora.begin()
-lora.setFrequency(865000000)   # Adjust frequency as per your region
-lora.setTxPower(22, 1)         # 22 dBm, high power PA
-lora.setLoRaModulation(7, 125000, 5)  # SF7, BW=125kHz, CR=4/5
-lora.setPacketParams(255, 0, 1, True, False)
+lora.begin(freq=868000000, bw=125000, sf=7, cr=5, syncWord=0x12, power=22, currentLimit=60.0, preambleLength=8, implicit=False, implicitLen=0xFF)
 
-def nmea_to_decimal(raw, hemi, is_lat=True):
-    """Convert NMEA coordinate to decimal degrees"""
+print("LoRa transmitter ready...")
+
+def parse_gga(sentence):
     try:
-        if is_lat:
-            deg = int(raw[:2])
-            mins = float(raw[2:])
-        else:
-            deg = int(raw[:3])
-            mins = float(raw[3:])
-        dec = deg + mins / 60
-        if hemi in ["S", "W"]:
-            dec = -dec
-        return dec
-    except:
-        return None
+        parts = sentence.split(",")
+        if parts[0] != "$GPGGA":
+            return None, None
 
-def get_gps_data():
-    """Read GPS data from serial"""
-    while True:
-        line = gps.readline().decode("utf-8", errors="ignore").strip()
-        if line.startswith("$GPGGA"):
-            parts = line.split(",")
-            if len(parts) > 5 and parts[2] and parts[4]:
-                lat = nmea_to_decimal(parts[2], parts[3], is_lat=True)
-                lon = nmea_to_decimal(parts[4], parts[5], is_lat=False)
-                return lat, lon
-        time.sleep(0.1)
+        # Latitude
+        lat_raw = parts[2]
+        lat_hemi = parts[3]
+        lon_raw = parts[4]
+        lon_hemi = parts[5]
 
-# ---------------- Main Loop ----------------
-print("LoRa GNSS Transmitter started...")
+        if lat_raw == "" or lon_raw == "":
+            return None, None
+
+        lat_deg = float(lat_raw[:2])
+        lat_min = float(lat_raw[2:])
+        latitude = lat_deg + lat_min / 60.0
+        if lat_hemi == "S":
+            latitude *= -1
+
+        lon_deg = float(lon_raw[:3])
+        lon_min = float(lon_raw[3:])
+        longitude = lon_deg + lon_min / 60.0
+        if lon_hemi == "W":
+            longitude *= -1
+
+        return latitude, longitude
+    except Exception:
+        return None, None
 
 while True:
-    lat, lon = get_gps_data()
-    if lat and lon:
-        message = f"{lat:.6f},{lon:.6f}"
-        print(f"Transmitting: {message}")
-        lora.beginPacket()
-        lora.print(message)
-        lora.endPacket()
-    time.sleep(1)   # send every 1 sec
+    line = gps.readline().decode("ascii", errors="ignore").strip()
+    if line.startswith("$GPGGA"):
+        lat, lon = parse_gga(line)
+        if lat and lon:
+            msg = f"{lat:.6f},{lon:.6f}"
+            print(f"Sending: {msg}")
+            lora.beginPacket()
+            lora.print(msg)
+            lora.endPacket()
+    time.sleep(1)
