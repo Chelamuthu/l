@@ -17,11 +17,11 @@ from LoRaRF import SX126x
 # ================================================
 # CONFIGURATION
 # ================================================
-# GPS Configuration
-GPS_PORT = "/dev/ttyAMA0"     # Use 'ls /dev/' to confirm
+# GPS Settings
+GPS_PORT = "/dev/serial0"      # Change to /dev/ttyAMA0 if needed
 GPS_BAUDRATE = 9600
 
-# LoRa SX1262 Pins
+# LoRa Pins
 busId = 0
 csId = 0
 resetPin = 18
@@ -30,9 +30,9 @@ irqPin = -1
 txenPin = 6
 rxenPin = -1
 
-# LoRa Parameters
-LORA_FREQ = 868000000   # 868 MHz
-PAYLOAD_LENGTH = 100    # Maximum message length
+# LoRa Frequency and Packet Size
+LORA_FREQ = 868000000          # 868 MHz
+PAYLOAD_LENGTH = 100           # Max size of message
 
 # ================================================
 # INITIALIZE LORA
@@ -46,8 +46,7 @@ LoRa.setDio2RfSwitch()
 LoRa.setFrequency(LORA_FREQ)
 LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
 LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, preambleLength=12,
-                   payloadLength=PAYLOAD_LENGTH, crcType=True)
+LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, preambleLength=12, payloadLength=PAYLOAD_LENGTH, crcType=True)
 LoRa.setSyncWord(0x3444)
 print("LoRa setup completed.\n")
 
@@ -55,23 +54,24 @@ print("LoRa setup completed.\n")
 # INITIALIZE GPS
 # ================================================
 print(f"Connecting to GPS module on {GPS_PORT} ...")
-gps_serial = serial.Serial(GPS_PORT, GPS_BAUDRATE, timeout=0)  # Non-blocking mode
+gps_serial = serial.Serial(GPS_PORT, GPS_BAUDRATE, timeout=0)  # Non-blocking read
 print("GPS serial initialized.\n")
 
 # ================================================
-# FUNCTION: PARSE GPS DATA
+# FUNCTION: PARSE GPS
 # ================================================
 def parse_gps(line):
-    """Parses $GPRMC NMEA sentence and returns dict with GPS data."""
+    """
+    Parses $GPRMC or $GNRMC NMEA sentence.
+    Returns dict with latitude, longitude, speed, timestamp.
+    """
     try:
         if line.startswith('$GPRMC') or line.startswith('$GNRMC'):
             msg = pynmea2.parse(line)
+            if msg.status == 'A':  # Active Fix only
+                speed_kmh = float(msg.spd_over_grnd or 0.0) * 1.852  # knots -> km/h
 
-            if msg.status == 'A':  # A = Active fix, V = Void
-                # Speed conversion: knots → km/h
-                speed_kmh = float(msg.spd_over_grnd or 0.0) * 1.852
-
-                # Date + Time
+                # Build timestamp
                 if msg.datestamp and msg.timestamp:
                     timestamp = f"{msg.datestamp.strftime('%Y-%m-%d')} {msg.timestamp}"
                 else:
@@ -86,7 +86,7 @@ def parse_gps(line):
     except pynmea2.ParseError:
         return None
     except Exception as e:
-        print(f"[ERROR] GPS parse failed: {e}")
+        print(f"[ERROR] GPS parsing failed: {e}")
         return None
     return None
 
@@ -98,45 +98,42 @@ buffer = ""
 
 try:
     while True:
+        # Read GPS data
         if gps_serial.in_waiting > 0:
-            # Read all available GPS bytes
             raw_data = gps_serial.read(gps_serial.in_waiting).decode('ascii', errors='replace')
             buffer += raw_data
 
-            # Process full sentences
+            # Process line-by-line
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 line = line.strip()
-
                 if not line:
                     continue
 
-                # DEBUG: Show raw GPS
-                # print(f"[GPS RAW] {line}")
-
+                # Parse GPS line
                 gps_data = parse_gps(line)
                 if gps_data:
-                    # Build formatted GPS message
+                    # Create formatted message with ONLY required fields
                     message = (
-                        f"Lat:{gps_data['latitude']:.6f},"
-                        f"Lon:{gps_data['longitude']:.6f},"
-                        f"Speed:{gps_data['speed_kmh']}km/h,"
-                        f"Time:{gps_data['timestamp']}"
+                        f"{gps_data['latitude']:.6f},"
+                        f"{gps_data['longitude']:.6f},"
+                        f"{gps_data['speed_kmh']}km/h,"
+                        f"{gps_data['timestamp']}"
                     )
 
-                    # Ensure it fits in LoRa packet
+                    # Trim message if too long
                     if len(message) > PAYLOAD_LENGTH:
                         message = message[:PAYLOAD_LENGTH]
 
-                    # Convert to bytes for LoRa
+                    # Convert to bytes
                     message_bytes = list(message.encode('utf-8'))
 
-                    # Transmit
+                    # Transmit via LoRa
                     print(f"[LORA] Sending: {message}")
                     LoRa.beginPacket()
                     LoRa.write(message_bytes, len(message_bytes))
                     LoRa.endPacket()
-                    LoRa.wait()  # Wait for completion
+                    LoRa.wait()
 
                     print("Transmit Complete | Time: {:.2f} ms | Rate: {:.2f} byte/s\n".format(
                         LoRa.transmitTime(), LoRa.dataRate()
