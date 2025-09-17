@@ -18,7 +18,7 @@ from LoRaRF import SX126x
 # CONFIGURATION
 # ================================================
 # GPS Configuration
-GPS_PORT = "/dev/serial0"     # Use 'ls /dev/' to confirm
+GPS_PORT = "/dev/ttyAMA0"     # Use 'ls /dev/' to confirm
 GPS_BAUDRATE = 9600
 
 # LoRa SX1262 Pins
