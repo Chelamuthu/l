@@ -16,11 +16,10 @@ from LoRaRF import SX126x
 # ===============================
 # CONFIGURATION
 # ===============================
-# Neo-6M GPS serial configuration
-GPS_PORT = "/dev/serial0"   # Raspberry Pi UART0
+GPS_PORT = "/dev/serial0"    # Neo-6M GPS
 GPS_BAUDRATE = 9600
 
-# LoRa configuration
+# LoRa SX1262 Pins
 busId = 0
 csId = 0
 resetPin = 18
@@ -41,7 +40,7 @@ LoRa.setDio2RfSwitch()
 LoRa.setFrequency(868000000)  # 868 MHz
 LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
 
-# Modulation Parameters
+# LoRa Modulation
 sf = 7
 bw = 125000
 cr = 5
@@ -50,10 +49,9 @@ LoRa.setLoRaModulation(sf, bw, cr)
 # Packet Parameters
 headerType = LoRa.HEADER_EXPLICIT
 preambleLength = 12
-payloadLength = 100  # max GPS packet size
+payloadLength = 100
 crcType = True
 LoRa.setLoRaPacket(headerType, preambleLength, payloadLength, crcType)
-
 LoRa.setSyncWord(0x3444)
 
 print("LoRa setup completed.\n")
@@ -61,35 +59,27 @@ print("LoRa setup completed.\n")
 # ===============================
 # Initialize GPS
 # ===============================
-print("Connecting to GPS module on", GPS_PORT)
-gps_serial = serial.Serial(GPS_PORT, GPS_BAUDRATE, timeout=1.0)
+print(f"Connecting to GPS module on {GPS_PORT}")
+gps_serial = serial.Serial(GPS_PORT, GPS_BAUDRATE, timeout=0)  # Non-blocking
 
 # ===============================
-# Helper Function to Read GPS
+# Helper Function: Parse GPS
 # ===============================
-def get_gps_data():
-    """
-    Reads NMEA sentence from Neo-6M and parses GPS data.
-    Returns dictionary with latitude, longitude, speed, and timestamp.
-    """
+def get_gps_data(line):
     try:
-        line = gps_serial.readline().decode('ascii', errors='replace').strip()
         if line.startswith('$GPRMC') or line.startswith('$GNRMC'):
             msg = pynmea2.parse(line)
 
-            if msg.status == 'A':  # A = Active, V = Void
+            if msg.status == 'A':  # Active fix
                 lat = msg.latitude
                 lon = msg.longitude
 
-                # Speed in knots -> km/h
-                try:
-                    speed_knots = float(msg.spd_over_grnd)
-                except:
-                    speed_knots = 0.0
+                # Speed: knots → km/h
+                speed_knots = float(msg.spd_over_grnd or 0.0)
                 speed_kmh = speed_knots * 1.852
 
-                # Safe timestamp handling
-                if msg.datestamp is not None and msg.timestamp is not None:
+                # Timestamp
+                if msg.datestamp and msg.timestamp:
                     timestamp = msg.datestamp.strftime('%Y-%m-%d') + " " + str(msg.timestamp)
                 else:
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -103,53 +93,57 @@ def get_gps_data():
     except pynmea2.ParseError:
         return None
     except Exception as e:
-        print(f"GPS read error: {e}")
+        print(f"GPS parse error: {e}")
         return None
     return None
 
 # ===============================
 # LoRa Transmit GPS Data
 # ===============================
-print("-- LoRa GPS Transmitter --\n")
+print("-- LoRa GPS Transmitter (Real-Time) --\n")
+
+buffer = ""
 
 try:
     while True:
-        gps_data = get_gps_data()
-        if gps_data:
-            # Create formatted GPS message
-            message = (
-                f"Lat:{gps_data['latitude']:.6f},"
-                f"Lon:{gps_data['longitude']:.6f},"
-                f"Speed:{gps_data['speed_kmh']}km/h,"
-                f"Time:{gps_data['timestamp']}"
-            )
+        # Read GPS data non-blocking
+        if gps_serial.in_waiting > 0:
+            data = gps_serial.read(gps_serial.in_waiting).decode('ascii', errors='replace')
+            buffer += data
 
-            # Trim message if it exceeds LoRa packet limit
-            if len(message) > payloadLength:
-                message = message[:payloadLength]
+            # Process full NMEA sentences
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip()
 
-            # Convert to byte array
-            message_bytes = list(message.encode('utf-8'))
+                gps_data = get_gps_data(line)
+                if gps_data:
+                    # Build message
+                    message = (
+                        f"Lat:{gps_data['latitude']:.6f},"
+                        f"Lon:{gps_data['longitude']:.6f},"
+                        f"Speed:{gps_data['speed_kmh']}km/h,"
+                        f"Time:{gps_data['timestamp']}"
+                    )
 
-            # Send via LoRa
-            LoRa.beginPacket()
-            LoRa.write(message_bytes, len(message_bytes))
-            LoRa.endPacket()
+                    # Ensure message fits LoRa payload
+                    if len(message) > payloadLength:
+                        message = message[:payloadLength]
 
-            # Wait until transmission finishes
-            LoRa.wait()
+                    # Send via LoRa
+                    message_bytes = list(message.encode('utf-8'))
+                    LoRa.beginPacket()
+                    LoRa.write(message_bytes, len(message_bytes))
+                    LoRa.endPacket()
+                    LoRa.wait()  # Wait until transmission complete
 
-            # Debug print
-            print(f"Sent GPS Data: {message}")
-            print("Transmit Time: {:.2f} ms | Data Rate: {:.2f} byte/s\n".format(
-                LoRa.transmitTime(), LoRa.dataRate()
-            ))
+                    # Debug
+                    print(f"Sent GPS Data: {message}")
+                    print("Transmit Time: {:.2f} ms | Data Rate: {:.2f} byte/s\n".format(
+                        LoRa.transmitTime(), LoRa.dataRate()
+                    ))
 
-        else:
-            print("Waiting for valid GPS fix...")
-
-        time.sleep(1)  # Adjust transmission interval
-
+        # No sleep → real-time loop
 except KeyboardInterrupt:
     print("Stopping transmitter...")
 
