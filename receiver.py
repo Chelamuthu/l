@@ -1,63 +1,96 @@
 #!/usr/bin/python3
+# -- coding: UTF-8 --
+
 import serial
 import pynmea2
 import time
-import math
+from datetime import datetime
 
-# UART configuration
-UART_PORT = "/dev/ttyAMA0"  # GPS connected to Pi's main UART
-BAUDRATE = 9600             # Neo-6M default baud rate
+# ===============================
+# CONFIGURATION
+# ===============================
+UART_PORT = "/dev/ttyAMA0"   # GPS UART port (adjust if using USB, e.g., "/dev/ttyUSB0")
+BAUDRATE = 9600              # Default GPS baud rate
 
-# Haversine formula for distance calculation
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371000  # Earth radius in meters
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-    
-    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
-    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+# ===============================
+# INITIALIZE SERIAL
+# ===============================
+try:
+    gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=1)
+    print(f"[INFO] Connected to GPS module on {UART_PORT} at {BAUDRATE} baud.")
+except serial.SerialException as e:
+    print(f"[ERROR] Could not open serial port {UART_PORT}: {e}")
+    exit(1)
 
-def read_gps():
+# ===============================
+# HELPER FUNCTION
+# ===============================
+def parse_gps_data(line):
+    """Parse NMEA sentence and extract useful data safely"""
     try:
-        gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=1)
-        print("Connected to Neo-6M GPS on", UART_PORT)
+        msg = pynmea2.parse(line)
+        
+        if isinstance(msg, pynmea2.types.talker.GGA):  # GGA sentence = fix data
+            if msg.latitude and msg.longitude:
+                return {
+                    "type": "GGA",
+                    "latitude": msg.latitude,
+                    "longitude": msg.longitude,
+                    "altitude": msg.altitude,
+                    "timestamp": msg.timestamp
+                }
+            else:
+                return None
 
-        last_lat, last_lon = None, None
-        total_distance = 0.0
-
-        while True:
-            line = gps_serial.readline().decode('ascii', errors='replace').strip()
-
-            if line.startswith('$GPGGA') or line.startswith('$GNGGA'):  # Position fix
-                msg = pynmea2.parse(line)
-                latitude, longitude, altitude = msg.latitude, msg.longitude, msg.altitude
-
-                print(f"[GGA] Lat: {latitude:.6f}, Lon: {longitude:.6f}, Alt: {altitude:.2f} m")
-
-                # Calculate distance traveled
-                if last_lat is not None and last_lon is not None:
-                    distance = haversine(last_lat, last_lon, latitude, longitude)
-                    total_distance += distance
-                    print(f"Moved: {distance:.2f} m | Total: {total_distance:.2f} m")
-
-                last_lat, last_lon = latitude, longitude
-
-            elif line.startswith('$GPRMC') or line.startswith('$GNRMC'):  # Speed + time
-                msg = pynmea2.parse(line)
-                speed_knots = float(msg.spd_over_grnd) if msg.spd_over_grnd else 0.0
-                speed_kmh = speed_knots * 1.852  # Convert knots to km/h
-
-                print(f"[RMC] Time: {msg.timestamp} | Speed: {speed_kmh:.2f} km/h | Status: {msg.status}")
-
-            time.sleep(0.1)
-
-    except serial.SerialException:
-        print("Error: Could not open GPS serial port.")
-    except KeyboardInterrupt:
-        print("\nExiting GPS reader...")
+        elif isinstance(msg, pynmea2.types.talker.RMC):  # RMC sentence = speed and time
+            if msg.status == "A":  # A = Active fix
+                return {
+                    "type": "RMC",
+                    "latitude": msg.latitude,
+                    "longitude": msg.longitude,
+                    "speed_knots": msg.spd_over_grnd,
+                    "timestamp": msg.datestamp
+                }
+            else:
+                return None
+        else:
+            return None
+    except pynmea2.ParseError:
+        return None
     except Exception as e:
-        print("Unexpected error:", str(e))
+        print(f"[WARN] Unexpected parsing error: {e}")
+        return None
 
-if __name__ == "__main__":
-    read_gps()
+# ===============================
+# MAIN LOOP
+# ===============================
+print("[INFO] Reading GPS data... Press CTRL+C to stop.\n")
+try:
+    while True:
+        line = gps_serial.readline().decode('ascii', errors='replace').strip()
+        
+        if not line.startswith('$'):  # Ignore garbage data
+            continue
+
+        gps_data = parse_gps_data(line)
+        if gps_data:
+            if gps_data["type"] == "GGA":
+                print(f"[GGA] Time: {gps_data['timestamp']} | "
+                      f"Lat: {gps_data['latitude']:.6f} | "
+                      f"Lon: {gps_data['longitude']:.6f} | "
+                      f"Altitude: {gps_data['altitude']} m")
+            
+            elif gps_data["type"] == "RMC":
+                speed_kmh = gps_data["speed_knots"] * 1.852 if gps_data["speed_knots"] else 0
+                print(f"[RMC] Date: {gps_data['timestamp']} | "
+                      f"Lat: {gps_data['latitude']:.6f} | "
+                      f"Lon: {gps_data['longitude']:.6f} | "
+                      f"Speed: {speed_kmh:.2f} km/h")
+
+        time.sleep(0.1)  # Small delay to prevent CPU overuse
+
+except KeyboardInterrupt:
+    print("\n[INFO] GPS reading stopped by user.")
+finally:
+    gps_serial.close()
+    print("[INFO] Serial port closed.")
