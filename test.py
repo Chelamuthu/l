@@ -53,7 +53,9 @@ if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
 
 LoRa.setDio2RfSwitch()
 LoRa.setFrequency(868000000)  # 868 MHz for India/Europe
-LoRa.setTxPower(22, LoRa.TX_POWER_SX1262)
+
+# 🔹 Lower power to prevent Pi shutdown
+LoRa.setTxPower(14, LoRa.TX_POWER_SX1262)  # Safe power level
 
 # LoRa Modulation Parameters
 LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
@@ -91,7 +93,7 @@ def parse_gps_data(line):
         elif isinstance(msg, pynmea2.types.talker.RMC):
             if msg.status == "A":  # A = Active fix
                 speed_knots = msg.spd_over_grnd if msg.spd_over_grnd is not None else 0.0
-                speed_kmh = speed_knots * 1.852
+                speed_kmh = speed_knots * 1.852  # convert knots to km/h
 
                 return {
                     "type": "RMC",
@@ -153,22 +155,30 @@ try:
             if len(message) > payloadLength:
                 message = message[:payloadLength]  # Trim to fit LoRa payload
 
-            message_bytes = list(message.encode('utf-8'))
+            try:
+                message_bytes = list(message.encode('utf-8'))
 
-            LoRa.beginPacket()
-            LoRa.write(message_bytes, len(message_bytes))
-            LoRa.endPacket()
-            LoRa.wait()
+                LoRa.beginPacket()
+                LoRa.write(message_bytes, len(message_bytes))
+                LoRa.endPacket()
+                LoRa.wait()
 
-            print(f"[INFO] Sent via LoRa: {message}")
-            print("Transmit Time: {:.2f} ms | Data Rate: {:.2f} byte/s\n".format(
-                LoRa.transmitTime(), LoRa.dataRate()
-            ))
+                print(f"[INFO] Sent via LoRa: {message}")
+                print("Transmit Time: {:.2f} ms | Data Rate: {:.2f} byte/s\n".format(
+                    LoRa.transmitTime(), LoRa.dataRate()
+                ))
+
+                # 🔹 Small delay after send to prevent power surge
+                time.sleep(0.5)
+
+            except Exception as e:
+                print(f"[ERROR] Failed to send LoRa packet: {e}")
 
         else:
             print("[INFO] Waiting for valid GPS fix...")
 
-        time.sleep(1)  # Send every second
+        # Send data every 1 second
+        time.sleep(1)
 
 except KeyboardInterrupt:
     print("\n[INFO] Transmission stopped by user.")
