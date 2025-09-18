@@ -7,16 +7,12 @@ import time
 import serial
 import pynmea2
 
-# ===============================
-# CONFIGURATION
-# ===============================
 UART_PORT = "/dev/ttyAMA0"
 BAUDRATE = 9600
 payloadLength = 100
-SEND_INTERVAL = 1.0      # normal send interval
-MAX_DELAY = 1.2          # max allowed seconds without sending
+SEND_INTERVAL = 1.0
+MAX_DELAY = 1.2
 
-# LoRa Configuration
 busId = 0
 csId = 0
 resetPin = 18
@@ -25,16 +21,14 @@ irqPin = -1
 txenPin = 6
 rxenPin = -1
 
-# ===============================
-# IMPORT LORA LIBRARY
-# ===============================
+# Add LoRa library path
 currentdir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.dirname(os.path.dirname(currentdir)))
 from LoRaRF import SX126x
 
-# ===============================
-# INITIALIZE SERIAL (GPS)
-# ===============================
+# -------------------
+# Initialize GPS
+# -------------------
 try:
     gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=0.5)
     print(f"[INFO] Connected to GPS on {UART_PORT} at {BAUDRATE} baud.")
@@ -42,9 +36,9 @@ except serial.SerialException as e:
     print(f"[ERROR] Cannot open GPS port {UART_PORT}: {e}")
     sys.exit(1)
 
-# ===============================
-# INITIALIZE LORA
-# ===============================
+# -------------------
+# Initialize LoRa
+# -------------------
 def init_lora():
     LoRa = SX126x()
     if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
@@ -60,9 +54,9 @@ def init_lora():
 
 LoRa = init_lora()
 
-# ===============================
-# PARSE GPS DATA
-# ===============================
+# -------------------
+# Parse GPS
+# -------------------
 def parse_gps_data(line):
     try:
         msg = pynmea2.parse(line)
@@ -79,24 +73,24 @@ def parse_gps_data(line):
     except:
         return None
 
-# ===============================
+# -------------------
 # MAIN LOOP
-# ===============================
-print("[INFO] Waiting for GPS fix and transmitting live location...\n")
+# -------------------
+print("[INFO] Starting GPS + LoRa transmission...\n")
 buffer = ""
 last_gps_data = None
-last_send_time = time.time()
+last_successful_send = time.time()
 
 try:
     while True:
         current_time = time.time()
 
-        # Read GPS data
+        # Read GPS
         data = gps_serial.read(1024).decode('ascii', errors='replace')
         if data:
             buffer += data
             lines = buffer.split('\n')
-            buffer = lines[-1]  # incomplete line
+            buffer = lines[-1]
             for line in lines[:-1]:
                 line = line.strip()
                 if line.startswith('$'):
@@ -104,9 +98,8 @@ try:
                     if gps_data:
                         last_gps_data = gps_data
 
-        # Check if it's time to send
-        if current_time - last_send_time >= SEND_INTERVAL:
-            last_send_time = current_time
+        # Send message if interval passed
+        if current_time - last_successful_send >= SEND_INTERVAL:
             if last_gps_data:
                 message = (f"RMC|Date:{last_gps_data['date']}|Time:{last_gps_data['time']}|"
                            f"Lat:{last_gps_data['latitude']:.6f}|Lon:{last_gps_data['longitude']:.6f}|"
@@ -117,28 +110,38 @@ try:
             if len(message) > payloadLength:
                 message = message[:payloadLength]
 
+            # Attempt to send with try-except
             try:
                 LoRa.beginPacket()
                 LoRa.write(list(message.encode('utf-8')), len(message))
                 LoRa.endPacket()
-                LoRa.wait()
+
+                # Wait with timeout to avoid lock
+                wait_start = time.time()
+                while True:
+                    if LoRa.transmitDone():  # Check for completion
+                        break
+                    if time.time() - wait_start > 0.5:  # 0.5s timeout
+                        raise TimeoutError("LoRa transmit timeout")
+                    time.sleep(0.01)
+
                 print(f"[INFO] Sent via LoRa: {message}")
+                last_successful_send = time.time()
+
             except Exception as e:
                 print(f"[ERROR] LoRa send failed: {e}")
 
-        # ===============================
-        # Auto-restart if sending stuck
-        # ===============================
-        if current_time - last_send_time > MAX_DELAY:
+        # Auto-restart LoRa if no successful send in MAX_DELAY
+        if time.time() - last_successful_send > MAX_DELAY:
             print("[WARN] LoRa sender stuck >1.2s. Restarting LoRa module...")
             try:
                 LoRa.end()
             except:
                 pass
             LoRa = init_lora()
-            last_send_time = time.time()  # reset timer
+            last_successful_send = time.time()
 
-        time.sleep(0.05)  # small loop delay
+        time.sleep(0.05)
 
 except KeyboardInterrupt:
     print("\n[INFO] Transmission stopped by user.")
