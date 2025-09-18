@@ -59,12 +59,13 @@ LoRa.setSyncWord(0x3444)
 print("[INFO] LoRa ready.\n")
 
 # ==============================
-# GPS PARSER
+# GPS PARSER FUNCTION
 # ==============================
 def parse_gps_data(line):
+    """Parses NMEA sentence and extracts GPS data if fix is available."""
     try:
         msg = pynmea2.parse(line)
-        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":
+        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":  # 'A' means active fix
             speed_knots = msg.spd_over_grnd or 0.0
             speed_kmh = speed_knots * 1.852
             return {
@@ -79,42 +80,46 @@ def parse_gps_data(line):
         return None
 
 # ==============================
+# SEND VIA LORA
+# ==============================
+def send_lora_message(message):
+    """Send a UTF-8 message via LoRa, truncated to payloadLength."""
+    if len(message) > payloadLength:
+        message = message[:payloadLength]
+    message_bytes = list(message.encode('utf-8'))
+    LoRa.beginPacket()
+    LoRa.write(message_bytes, len(message_bytes))
+    LoRa.endPacket()
+    LoRa.wait()
+    print(f"[INFO] Sent via LoRa: {message}")
+
+# ==============================
 # MAIN LOOP
 # ==============================
 print("[INFO] Starting GPS + LoRa transmission...\n")
+
 try:
     while True:
-        try:
-            line = gps_serial.readline().decode('ascii', errors='replace').strip()
-            if not line.startswith('$'):
-                continue
+        line = gps_serial.readline().decode('ascii', errors='replace').strip()
 
+        gps_data = None
+        if line.startswith('$'):  # Valid NMEA sentence
             gps_data = parse_gps_data(line)
 
-            if gps_data:
-                message = (
-                    f"RMC|Date:{gps_data['date']}|Time:{gps_data['time']}|"
-                    f"Lat:{gps_data['latitude']:.6f}|Lon:{gps_data['longitude']:.6f}|"
-                    f"Speed:{gps_data['speed_kmh']:.2f}km/h"
-                )
+        if gps_data:
+            # Build message with GPS data
+            message = (
+                f"GNSS|Date:{gps_data['date']}|Time:{gps_data['time']}|"
+                f"Lat:{gps_data['latitude']:.6f}|Lon:{gps_data['longitude']:.6f}|"
+                f"Speed:{gps_data['speed_kmh']:.2f}km/h"
+            )
+        else:
+            # No GPS fix
+            message = "NO GNSS FIX"
 
-                if len(message) > payloadLength:
-                    message = message[:payloadLength]
-
-                message_bytes = list(message.encode('utf-8'))
-                LoRa.beginPacket()
-                LoRa.write(message_bytes, len(message_bytes))
-                LoRa.endPacket()
-                LoRa.wait()
-
-                print(f"[INFO] Sent via LoRa: {message}")
-                time.sleep(1.5)  # Allow LoRa module to stabilize
-            else:
-                print("[INFO] Waiting for valid GPS fix...")
-
-        except Exception as e:
-            print(f"[ERROR] Loop error: {e}")
-            time.sleep(1)
+        # Send message via LoRa every second
+        send_lora_message(message)
+        time.sleep(1)
 
 except KeyboardInterrupt:
     print("\n[INFO] Stopped by user.")
