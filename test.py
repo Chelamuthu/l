@@ -12,7 +12,7 @@ from datetime import datetime
 # CONFIGURATION
 # =======================================
 UART_PORT = "/dev/ttyAMA0"  # GPS UART port
-BAUDRATE = 9600
+BAUDRATE = 9600              # Default GPS baud rate
 
 # LoRa Configuration
 busId = 0
@@ -62,67 +62,80 @@ print("[INFO] LoRa ready.\n")
 # HELPER FUNCTION: PARSE GPS DATA
 # =======================================
 def parse_gps_data(line):
+    """Parse NMEA sentence and return useful GPS info"""
     try:
         msg = pynmea2.parse(line)
-        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":
-            speed_knots = msg.spd_over_grnd or 0.0
-            speed_kmh = speed_knots * 1.852
-            return {
-                "latitude": msg.latitude,
-                "longitude": msg.longitude,
-                "speed_kmh": speed_kmh,
-                "date": msg.datestamp.strftime("%d-%m-%Y") if msg.datestamp else "N/A",
-                "time": msg.timestamp.strftime("%H:%M:%S") if msg.timestamp else "N/A"
-            }
+        if isinstance(msg, pynmea2.types.talker.GGA):
+            if msg.latitude and msg.longitude:
+                return {
+                    "type": "GGA",
+                    "latitude": msg.latitude,
+                    "longitude": msg.longitude,
+                    "altitude": msg.altitude,
+                    "timestamp": msg.timestamp.strftime("%H:%M:%S") if msg.timestamp else "N/A"
+                }
+        elif isinstance(msg, pynmea2.types.talker.RMC):
+            if msg.status == "A":
+                speed_kmh = (msg.spd_over_grnd or 0.0) * 1.852
+                return {
+                    "type": "RMC",
+                    "latitude": msg.latitude,
+                    "longitude": msg.longitude,
+                    "speed_kmh": speed_kmh,
+                    "date": msg.datestamp.strftime("%d-%m-%Y") if msg.datestamp else "N/A",
+                    "timestamp": msg.timestamp.strftime("%H:%M:%S") if msg.timestamp else "N/A"
+                }
         return None
-    except Exception:
+    except pynmea2.ParseError:
+        return None
+    except Exception as e:
+        print(f"[WARN] Parsing error: {e}")
         return None
 
 # =======================================
 # MAIN LOOP
 # =======================================
-print("[INFO] Starting GPS + LoRa transmission...\n")
-last_gps_data = None  # Store last valid coordinates
+print("[INFO] Starting GPS + LoRa transmission... Press CTRL+C to stop.\n")
+last_gps_data = None
 
 try:
     while True:
-        try:
-            line = gps_serial.readline().decode('ascii', errors='replace').strip()
-            if line.startswith('$'):
-                gps_data = parse_gps_data(line)
-                if gps_data:
-                    last_gps_data = gps_data
+        line = gps_serial.readline().decode('ascii', errors='replace').strip()
+        if line.startswith('$'):
+            gps_data = parse_gps_data(line)
+            if gps_data:
+                last_gps_data = gps_data
 
-            # Use last known GPS if current line is invalid
-            if last_gps_data:
-                message = (
-                    f"RMC|Date:{last_gps_data['date']}|Time:{last_gps_data['time']}|"
-                    f"Lat:{last_gps_data['latitude']:.6f}|Lon:{last_gps_data['longitude']:.6f}|"
-                    f"Speed:{last_gps_data['speed_kmh']:.2f}km/h"
-                )
+        if last_gps_data:
+            if last_gps_data["type"] == "GGA":
+                message = (f"GGA|Time:{last_gps_data['timestamp']}|"
+                           f"Lat:{last_gps_data['latitude']:.6f}|"
+                           f"Lon:{last_gps_data['longitude']:.6f}|"
+                           f"Alt:{last_gps_data['altitude']}m")
+            else:  # RMC
+                message = (f"RMC|Date:{last_gps_data['date']}|Time:{last_gps_data['timestamp']}|"
+                           f"Lat:{last_gps_data['latitude']:.6f}|"
+                           f"Lon:{last_gps_data['longitude']:.6f}|"
+                           f"Speed:{last_gps_data['speed_kmh']:.2f}km/h")
 
-                if len(message) > payloadLength:
-                    message = message[:payloadLength]
+            # Trim message to payload size
+            if len(message) > payloadLength:
+                message = message[:payloadLength]
 
+            try:
                 message_bytes = list(message.encode('utf-8'))
                 LoRa.beginPacket()
                 LoRa.write(message_bytes, len(message_bytes))
                 LoRa.endPacket()
                 LoRa.wait()
-
                 print(f"[INFO] Sent via LoRa: {message}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send LoRa packet: {e}")
 
-            else:
-                print("[INFO] Waiting for initial GPS fix...")
-
-            time.sleep(1)  # Transmit every 1 second
-
-        except Exception as e:
-            print(f"[ERROR] Loop error: {e}")
-            time.sleep(1)
+        time.sleep(1)  # Send every 1 second
 
 except KeyboardInterrupt:
-    print("\n[INFO] Stopped by user.")
+    print("\n[INFO] Transmission stopped by user.")
 
 finally:
     gps_serial.close()
