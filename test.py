@@ -1,71 +1,67 @@
-import os, sys
+#!/usr/bin/python3
+# -- coding: UTF-8 --
+
+import os
+import sys
 import time
+
+# ==============================
+# LoRa Configuration
+# ==============================
+BUS_ID = 0
+CS_ID = 0
+RESET_PIN = 18
+BUSY_PIN = 20
+IRQ_PIN = -1
+TX_EN = 6
+RX_EN = -1
+PAYLOAD_LENGTH = 100
+LORA_FREQ = 868000000
+
+# ==============================
+# IMPORT LORA LIBRARY
+# ==============================
 currentdir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.dirname(os.path.dirname(currentdir)))
 from LoRaRF import SX126x
 
 # ==============================
-# LORA CONFIGURATION
+# INITIALIZE LORA
 # ==============================
-busId = 0
-csId = 0
-resetPin = 18
-busyPin = 20
-irqPin = -1
-txenPin = 6
-rxenPin = -1
-
+print("[INFO] Initializing SX1262 LoRa Module for receiving...")
 LoRa = SX126x()
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Cannot start LoRa")
+
+if not LoRa.begin(BUS_ID, CS_ID, RESET_PIN, BUSY_PIN, IRQ_PIN, TX_EN, RX_EN):
+    raise Exception("Failed to initialize LoRa module!")
 
 LoRa.setDio2RfSwitch()
-LoRa.setFrequency(868000000)
-LoRa.setRxGain(LoRa.RX_GAIN_POWER_SAVING)
-
-# Modulation parameters
-sf = 7
-bw = 125000
-cr = 5
-LoRa.setLoRaModulation(sf, bw, cr)
-
-# Packet parameters
-headerType = LoRa.HEADER_EXPLICIT
-preambleLength = 12
-payloadLength = 15
-crcType = True
-LoRa.setLoRaPacket(headerType, preambleLength, payloadLength, crcType)
+LoRa.setFrequency(LORA_FREQ)
+LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
+LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, PAYLOAD_LENGTH, True)
 LoRa.setSyncWord(0x3444)
+LoRa.setRxContinuous()  # Set continuous receive mode
+print("[INFO] LoRa Receiver ready.\n")
 
-print("\n-- LoRa Receiver with Antenna Check --\n")
+# ==============================
+# MAIN LOOP
+# ==============================
+print("[INFO] Waiting for incoming LoRa packets...\n")
 
 try:
     while True:
-        LoRa.request()
-        LoRa.wait()
+        if LoRa.available():
+            packet = LoRa.read(PAYLOAD_LENGTH)
+            try:
+                message = bytes(packet).decode('utf-8').rstrip('\x00')
+                print(f"[RECEIVED] {message}")
+            except Exception as e:
+                print(f"[ERROR] Failed to decode packet: {e}")
 
-        message = ""
-        while LoRa.available() > 1:
-            message += chr(LoRa.read())
-        counter = LoRa.read() if LoRa.available() else 0
-
-        # Antenna detection based on RSSI
-        rssi = LoRa.packetRssi()
-        if rssi < -100:  # very weak signal likely no antenna
-            antenna_status = "Antenna NOT connected"
-        else:
-            antenna_status = "Antenna connected"
-
-        # Print received message if any
-        if message:
-            print(f"Message received: {message}  Counter: {counter}")
-        
-        print(f"{antenna_status} | RSSI: {rssi:.2f} dBm | SNR: {LoRa.snr():.2f} dB")
-
-        time.sleep(0.05)
+        time.sleep(0.1)  # Small delay to prevent CPU hog
 
 except KeyboardInterrupt:
-    print("\n[INFO] Stopped by user")
+    print("\n[INFO] Receiver stopped by user.")
 
 finally:
     LoRa.end()
+    print("[INFO] LoRa receiver closed safely.")
