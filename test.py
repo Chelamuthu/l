@@ -62,6 +62,7 @@ print("[INFO] LoRa ready.\n")
 # GPS PARSER
 # ==============================
 def parse_gps_data(line):
+    """Parse NMEA sentence and return valid RMC data if available."""
     try:
         msg = pynmea2.parse(line)
         if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":
@@ -82,9 +83,14 @@ def parse_gps_data(line):
 # MAIN LOOP
 # ==============================
 print("[INFO] Starting GPS + LoRa transmission...\n")
+
+last_valid_data = None      # To track last valid GPS data
+gps_fix_message_shown = False  # Prevent repeated "Waiting for fix" spam
+
 try:
     while True:
         try:
+            # Read a line from GPS
             line = gps_serial.readline().decode('ascii', errors='replace').strip()
             if not line.startswith('$'):
                 continue
@@ -92,15 +98,22 @@ try:
             gps_data = parse_gps_data(line)
 
             if gps_data:
+                # Reset the waiting message flag when valid data comes in
+                gps_fix_message_shown = False
+                last_valid_data = gps_data
+
+                # Prepare message
                 message = (
                     f"RMC|Date:{gps_data['date']}|Time:{gps_data['time']}|"
                     f"Lat:{gps_data['latitude']:.6f}|Lon:{gps_data['longitude']:.6f}|"
                     f"Speed:{gps_data['speed_kmh']:.2f}km/h"
                 )
 
+                # Ensure message fits within LoRa payload
                 if len(message) > payloadLength:
                     message = message[:payloadLength]
 
+                # Send over LoRa
                 message_bytes = list(message.encode('utf-8'))
                 LoRa.beginPacket()
                 LoRa.write(message_bytes, len(message_bytes))
@@ -108,9 +121,32 @@ try:
                 LoRa.wait()
 
                 print(f"[INFO] Sent via LoRa: {message}")
-                time.sleep(1.5)  # Allow LoRa module to stabilize
+                time.sleep(1.5)  # LoRa stabilize delay
+
             else:
-                print("[INFO] Waiting for valid GPS fix...")
+                # Only show waiting message once, not every second
+                if not gps_fix_message_shown:
+                    print("[INFO] Waiting for valid GPS fix...")
+                    gps_fix_message_shown = True
+
+                # Still send last valid location periodically
+                if last_valid_data:
+                    cached_message = (
+                        f"CACHED|Date:{last_valid_data['date']}|Time:{last_valid_data['time']}|"
+                        f"Lat:{last_valid_data['latitude']:.6f}|Lon:{last_valid_data['longitude']:.6f}|"
+                        f"Speed:{last_valid_data['speed_kmh']:.2f}km/h"
+                    )
+                    if len(cached_message) > payloadLength:
+                        cached_message = cached_message[:payloadLength]
+
+                    cached_bytes = list(cached_message.encode('utf-8'))
+                    LoRa.beginPacket()
+                    LoRa.write(cached_bytes, len(cached_bytes))
+                    LoRa.endPacket()
+                    LoRa.wait()
+
+                    print(f"[WARN] Sent last known location: {cached_message}")
+                    time.sleep(2)
 
         except Exception as e:
             print(f"[ERROR] Loop error: {e}")
