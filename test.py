@@ -7,14 +7,21 @@ import time
 import serial
 import pynmea2
 from datetime import datetime
+import hashlib
 
 # ==============================
 # CONFIGURATION
 # ==============================
-UART_PORT = "/dev/ttyAMA0"  # Neo-6M GPS connected to Pi UART
+UART_PORT = "/dev/ttyAMA0"      # Neo-6M GPS connected to Pi UART
 BAUDRATE = 9600
 
 # LoRa Configuration
+LORA_FREQ = 868000000
+PAYLOAD_LENGTH = 100
+LORA_POWER = 14  # dBm
+TX_INTERVAL = 1  # seconds between transmissions
+
+# SX1262 Pin Configuration
 busId = 0
 csId = 0
 resetPin = 18
@@ -22,7 +29,6 @@ busyPin = 20
 irqPin = -1
 txenPin = 6
 rxenPin = -1
-payloadLength = 100
 
 # ==============================
 # IMPORT LORA LIBRARY
@@ -32,45 +38,54 @@ sys.path.append(os.path.dirname(os.path.dirname(currentdir)))
 from LoRaRF import SX126x
 
 # ==============================
-# INITIALIZE SERIAL (GPS)
+# INITIALIZATION
 # ==============================
-try:
-    gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=1)
-    print(f"[INFO] Connected to GPS module on {UART_PORT} at {BAUDRATE} baud.")
-except serial.SerialException as e:
-    print(f"[ERROR] Cannot open GPS port {UART_PORT}: {e}")
-    sys.exit(1)
+def init_gps():
+    """Initialize GPS serial connection."""
+    try:
+        gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=1)
+        log(f"GPS connected on {UART_PORT} at {BAUDRATE} baud.")
+        return gps_serial
+    except serial.SerialException as e:
+        log(f"[ERROR] Cannot open GPS port {UART_PORT}: {e}", error=True)
+        sys.exit(1)
+
+def init_lora():
+    """Initialize LoRa module."""
+    log("Initializing LoRa...")
+    LoRa = SX126x()
+    if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
+        raise Exception("Failed to initialize LoRa module!")
+
+    LoRa.setDio2RfSwitch()
+    LoRa.setFrequency(LORA_FREQ)
+    LoRa.setTxPower(LORA_POWER, LoRa.TX_POWER_SX1262)
+    LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
+    LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, PAYLOAD_LENGTH, True)
+    LoRa.setSyncWord(0x3444)
+    log("LoRa initialized successfully.")
+    return LoRa
+
+def log(message, error=False):
+    """Timestamped logging."""
+    now = datetime.now().strftime("%H:%M:%S")
+    prefix = "[ERROR]" if error else "[INFO]"
+    print(f"{prefix} {now} - {message}")
 
 # ==============================
-# INITIALIZE LORA
-# ==============================
-print("[INFO] Initializing LoRa...")
-LoRa = SX126x()
-
-if not LoRa.begin(busId, csId, resetPin, busyPin, irqPin, txenPin, rxenPin):
-    raise Exception("Failed to initialize LoRa module!")
-
-LoRa.setDio2RfSwitch()
-LoRa.setFrequency(868000000)
-LoRa.setTxPower(14, LoRa.TX_POWER_SX1262)  # Safe power
-LoRa.setLoRaModulation(sf=7, bw=125000, cr=5)
-LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, 12, payloadLength, True)
-LoRa.setSyncWord(0x3444)
-print("[INFO] LoRa ready.\n")
-
-# ==============================
-# GPS PARSER
+# GPS DATA PARSING
 # ==============================
 def parse_gps_data(line):
+    """Parse NMEA GPS data and return useful fields."""
     try:
         msg = pynmea2.parse(line)
-        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":  # A = Active fix
+        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":
             speed_knots = msg.spd_over_grnd or 0.0
             speed_kmh = speed_knots * 1.852
             return {
                 "latitude": msg.latitude,
                 "longitude": msg.longitude,
-                "speed_kmh": speed_kmh,
+                "speed_kmh": round(speed_kmh, 2),
                 "date": msg.datestamp.strftime("%d-%m-%Y") if msg.datestamp else "N/A",
                 "time": msg.timestamp.strftime("%H:%M:%S") if msg.timestamp else "N/A"
             }
@@ -79,54 +94,82 @@ def parse_gps_data(line):
         return None
 
 # ==============================
-# MAIN LOOP
+# CHECKSUM GENERATION
 # ==============================
-print("[INFO] Starting GPS + LoRa transmission...\n")
+def generate_checksum(data_str):
+    """Generate simple checksum for data integrity."""
+    return hashlib.md5(data_str.encode('utf-8')).hexdigest()[:6]
 
-gps_fix_acquired = False  # To avoid repeated "waiting" messages
-try:
-    while True:
-        line = gps_serial.readline().decode('ascii', errors='replace').strip()
-        if not line.startswith('$'):
-            continue
+# ==============================
+# SEND VIA LORA
+# ==============================
+def send_lora_data(LoRa, message):
+    """Send data via LoRa after trimming to payload length."""
+    if len(message) > PAYLOAD_LENGTH:
+        message = message[:PAYLOAD_LENGTH]
 
-        gps_data = parse_gps_data(line)
+    message_bytes = list(message.encode('utf-8'))
+    LoRa.beginPacket()
+    LoRa.write(message_bytes, len(message_bytes))
+    LoRa.endPacket()
+    LoRa.wait()
+    log(f"Sent via LoRa: {message}")
 
-        if gps_data:
-            gps_fix_acquired = True  # Got a fix
-            # Build message
-            message = (
-                f"RMC|Date:{gps_data['date']}|Time:{gps_data['time']}|"
-                f"Lat:{gps_data['latitude']:.6f}|Lon:{gps_data['longitude']:.6f}|"
-                f"Speed:{gps_data['speed_kmh']:.2f}km/h"
-            )
+# ==============================
+# MAIN FUNCTION
+# ==============================
+def main():
+    gps_serial = init_gps()
+    LoRa = init_lora()
 
-            # Ensure message fits in LoRa packet
-            if len(message) > payloadLength:
-                message = message[:payloadLength]
+    packet_counter = 0
+    gps_fix_acquired = False
+    last_sent_time = time.monotonic()
 
-            # Send via LoRa
-            message_bytes = list(message.encode('utf-8'))
-            LoRa.beginPacket()
-            LoRa.write(message_bytes, len(message_bytes))
-            LoRa.endPacket()
-            LoRa.wait()
+    log("Starting GPS + LoRa transmission...\n")
 
-            print(f"[INFO] Sent via LoRa: {message}")
+    try:
+        while True:
+            line = gps_serial.readline().decode('ascii', errors='replace').strip()
+            if not line.startswith('$'):
+                continue
 
-            # Wait exactly 1 second before next transmission
-            time.sleep(1)
+            gps_data = parse_gps_data(line)
 
-        else:
-            if not gps_fix_acquired:
-                print("[INFO] Waiting for GPS fix...")  # Print only once until fix is found
-                gps_fix_acquired = True  # Avoid repeated prints
-            # Still check every second
-            time.sleep(1)
+            # Send every TX_INTERVAL seconds
+            current_time = time.monotonic()
+            if current_time - last_sent_time >= TX_INTERVAL:
+                last_sent_time = current_time
 
-except KeyboardInterrupt:
-    print("\n[INFO] Stopped by user.")
-finally:
-    gps_serial.close()
-    LoRa.end()
-    print("[INFO] Closed GPS and LoRa safely.")
+                if gps_data:
+                    gps_fix_acquired = True
+                    packet_counter += 1
+
+                    # Build structured message
+                    core_message = (
+                        f"PKT:{packet_counter}|Date:{gps_data['date']}|Time:{gps_data['time']}|"
+                        f"Lat:{gps_data['latitude']:.6f}|Lon:{gps_data['longitude']:.6f}|"
+                        f"Speed:{gps_data['speed_kmh']:.2f}km/h"
+                    )
+                    checksum = generate_checksum(core_message)
+                    final_message = f"{core_message}|CHK:{checksum}"
+
+                    send_lora_data(LoRa, final_message)
+
+                else:
+                    if not gps_fix_acquired:
+                        log("Waiting for GPS fix...")
+                        gps_fix_acquired = True  # Only log once until fix
+
+    except KeyboardInterrupt:
+        log("Stopped by user.")
+    finally:
+        gps_serial.close()
+        LoRa.end()
+        log("Closed GPS and LoRa safely.")
+
+# ==============================
+# ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    main()
