@@ -11,7 +11,7 @@ from datetime import datetime
 # ==============================
 # CONFIGURATION
 # ==============================
-UART_PORT = "/dev/ttyAMA0"  # Neo-6M GPS connected to Pi UART
+UART_PORT = "/dev/ttyAMA0"  # Neo-6M GPS connected to Raspberry Pi UART
 BAUDRATE = 9600
 
 # LoRa Configuration
@@ -35,7 +35,7 @@ from LoRaRF import SX126x
 # INITIALIZE SERIAL (GPS)
 # ==============================
 try:
-    gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=1)
+    gps_serial = serial.Serial(UART_PORT, BAUDRATE, timeout=0.5)  # Non-blocking, fast reading
     print(f"[INFO] Connected to GPS module on {UART_PORT} at {BAUDRATE} baud.")
 except serial.SerialException as e:
     print(f"[ERROR] Cannot open GPS port {UART_PORT}: {e}")
@@ -59,15 +59,17 @@ LoRa.setSyncWord(0x3444)
 print("[INFO] LoRa ready.\n")
 
 # ==============================
-# GPS PARSER FUNCTION
+# PARSE GPS DATA
 # ==============================
 def parse_gps_data(line):
-    """Parses NMEA sentence and extracts GPS data if fix is available."""
+    """Parse NMEA sentence and return GPS fix info."""
     try:
         msg = pynmea2.parse(line)
-        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":  # 'A' means active fix
+        
+        # Use RMC for location + speed
+        if isinstance(msg, pynmea2.types.talker.RMC) and msg.status == "A":  # A = Active fix
             speed_knots = msg.spd_over_grnd or 0.0
-            speed_kmh = speed_knots * 1.852
+            speed_kmh = speed_knots * 1.852  # Convert knots to km/h
             return {
                 "latitude": msg.latitude,
                 "longitude": msg.longitude,
@@ -75,15 +77,25 @@ def parse_gps_data(line):
                 "date": msg.datestamp.strftime("%d-%m-%Y") if msg.datestamp else "N/A",
                 "time": msg.timestamp.strftime("%H:%M:%S") if msg.timestamp else "N/A"
             }
+
+        # GGA can confirm fix quality
+        if isinstance(msg, pynmea2.types.talker.GGA) and int(msg.gps_qual) > 0:
+            return {
+                "latitude": msg.latitude,
+                "longitude": msg.longitude,
+                "speed_kmh": 0.0,  # No speed data in GGA
+                "date": datetime.utcnow().strftime("%d-%m-%Y"),
+                "time": datetime.utcnow().strftime("%H:%M:%S")
+            }
         return None
     except Exception:
         return None
 
 # ==============================
-# SEND VIA LORA
+# SEND LORA MESSAGE
 # ==============================
 def send_lora_message(message):
-    """Send a UTF-8 message via LoRa, truncated to payloadLength."""
+    """Send a message through LoRa, truncated if too long."""
     if len(message) > payloadLength:
         message = message[:payloadLength]
     message_bytes = list(message.encode('utf-8'))
@@ -96,30 +108,33 @@ def send_lora_message(message):
 # ==============================
 # MAIN LOOP
 # ==============================
-print("[INFO] Starting GPS + LoRa transmission...\n")
+print("[INFO] Starting live GPS tracking...\n")
 
 try:
     while True:
-        line = gps_serial.readline().decode('ascii', errors='replace').strip()
-
+        start_time = time.time()
         gps_data = None
-        if line.startswith('$'):  # Valid NMEA sentence
-            gps_data = parse_gps_data(line)
 
+        # Continuously read for ~1 second to catch the latest GPS sentence
+        while time.time() - start_time < 1.0:
+            line = gps_serial.readline().decode('ascii', errors='replace').strip()
+            if line.startswith('$'):
+                parsed = parse_gps_data(line)
+                if parsed:
+                    gps_data = parsed  # Use last valid fix in this second
+
+        # Build message
         if gps_data:
-            # Build message with GPS data
             message = (
                 f"GNSS|Date:{gps_data['date']}|Time:{gps_data['time']}|"
                 f"Lat:{gps_data['latitude']:.6f}|Lon:{gps_data['longitude']:.6f}|"
                 f"Speed:{gps_data['speed_kmh']:.2f}km/h"
             )
         else:
-            # No GPS fix
             message = "NO GNSS FIX"
 
-        # Send message via LoRa every second
+        # Send via LoRa
         send_lora_message(message)
-        time.sleep(1)
 
 except KeyboardInterrupt:
     print("\n[INFO] Stopped by user.")
